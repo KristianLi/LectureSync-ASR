@@ -563,60 +563,98 @@ class TermExtractor:
                 continue
             candidates[term] = (CATEGORY_SLIDE, score / max_kp)
 
+        terms = list(candidates)
+        spoken = self._free_matches([str(seg.get("text", "")) for seg in segments], terms)
+        printed = self._free_matches(page_texts, terms)
+
         entries: List[VocabEntry] = []
         for term, (category, tfidf) in candidates.items():
-            pattern = self._pattern(term)
-            occurrences = self._find_occurrences(pattern, segments)
-            slide_pages = [i for i, text in enumerate(page_texts) if pattern.search(text)]
+            occurrences = self._occurrences(segments, spoken.get(term, []))
+            slide_pages = sorted({index for index, _, _ in printed.get(term, [])})
             if not occurrences and not slide_pages:
                 continue
             if not occurrences and (not self.include_slide_only or category == CATEGORY_ACADEMIC):
                 continue
             if category == CATEGORY_SLIDE and not occurrences and tfidf < 0.5:
                 continue
+            count = len(spoken.get(term, []))
             score = _CATEGORY_WEIGHT[category] + tfidf
             score += 0.5 if (occurrences and slide_pages) else 0.0
             score += 0.3 if len(term.split()) > 1 else 0.0
-            score += 0.15 * math.log1p(len(occurrences))
+            score += 0.15 * math.log1p(count)
             score -= 0.75 if not occurrences else 0.0
             entries.append(
                 VocabEntry(
                     term=term,
                     category=category,
                     score=round(score, 4),
-                    count=len(occurrences),
+                    count=count,
                     slide_pages=slide_pages,
                     occurrences=occurrences,
                 )
             )
 
         entries.sort(key=lambda e: (-e.score, e.first_time if e.first_time is not None else float("inf"), e.term))
-        entries = self._drop_subsumed(entries)[:limit]
+        entries = entries[:limit]
         logger.info(
             "Vocabulary: %d entries (%d spoken, %d slide-only)",
             len(entries), sum(1 for e in entries if e.occurrences), sum(1 for e in entries if not e.occurrences),
         )  # fmt: skip
         return entries
 
-    @staticmethod
-    def _find_occurrences(pattern: Pattern[str], segments: Sequence[Mapping[str, Any]]) -> List[TermOccurrence]:
-        """Locate a term in the transcript and estimate when inside each segment it is said."""
-        occurrences: List[TermOccurrence] = []
-        for seg in segments:
-            text = str(seg.get("text", ""))
-            match = pattern.search(text)
-            if match is None:
+    def _free_matches(self, texts: Sequence[str], terms: Sequence[str]) -> Dict[str, List[Tuple[int, int, int]]]:
+        """Find every term in every text, ignoring matches nested inside a longer term.
+
+        ``pooling`` inside ``max pooling`` or ``neural network`` inside ``convolutional
+        neural network`` is not an independent use of the shorter term, so it is not
+        counted for it. A shorter term is still reported wherever it stands on its own.
+
+        Returns:
+            ``{term: [(text_index, start, end), ...]}`` in reading order.
+        """
+        free: Dict[str, List[Tuple[int, int, int]]] = defaultdict(list)
+        for index, text in enumerate(texts):
+            if not text:
                 continue
+            found = [
+                (match.start(), match.end(), term)
+                for term in terms
+                for match in self._pattern(term).finditer(text)
+            ]
+            for start, end, term in found:
+                nested = any(s <= start and end <= e and (e - s) > (end - start) for s, e, _ in found)
+                if not nested:
+                    free[term].append((index, start, end))
+        return free
+
+    @staticmethod
+    def _occurrences(
+        segments: Sequence[Mapping[str, Any]], matches: Sequence[Tuple[int, int, int]]
+    ) -> List[TermOccurrence]:
+        """Turn matches into occurrences (one per segment) with a time estimate and context.
+
+        The time inside a segment is interpolated from the character offset of the match.
+        """
+        occurrences: List[TermOccurrence] = []
+        seen_segments: Set[int] = set()
+        for index, match_start, match_end in matches:
+            if index in seen_segments:
+                continue
+            seen_segments.add(index)
+            seg = segments[index]
+            text = str(seg.get("text", ""))
             start, end = float(seg["start"]), float(seg["end"])
-            fraction = match.start() / max(1, len(text))
-            context = text
+            fraction = match_start / max(1, len(text))
+            context, cursor = text, 0
             for sentence in split_sentences(text):
-                if pattern.search(sentence) and len(sentence) >= 40:
+                position = text.find(sentence, cursor)
+                cursor = position + len(sentence)
+                if position <= match_start and match_end <= cursor and len(sentence) >= 40:
                     context = sentence
                     break
             occurrences.append(
                 TermOccurrence(
-                    segment_id=int(seg.get("id", len(occurrences))),
+                    segment_id=int(seg.get("id", index)),
                     time=round(start + fraction * (end - start), 2),
                     segment_start=round(start, 2),
                     page=int(seg.get("page", -1)),
@@ -624,32 +662,6 @@ class TermExtractor:
                 )
             )
         return occurrences
-
-    @staticmethod
-    def _drop_subsumed(entries: List[VocabEntry]) -> List[VocabEntry]:
-        """Remove entries that only ever occur as part of a longer entry.
-
-        ``pooling`` is dropped when every time it is heard it is inside ``max pooling``;
-        ``gradient`` survives next to ``gradient descent`` if it is also used on its own.
-        """
-        keys = [_singular_key(entry.term) for entry in entries]
-        kept: List[VocabEntry] = []
-        for index, entry in enumerate(entries):
-            own_segments = {occ.segment_id for occ in entry.occurrences}
-            own_pages = set(entry.slide_pages)
-            subsumed = False
-            for other_index, other in enumerate(entries):
-                if other_index == index or len(keys[other_index]) <= len(keys[index]):
-                    continue
-                if keys[index] not in keys[other_index]:
-                    continue
-                other_segments = {occ.segment_id for occ in other.occurrences}
-                if own_segments <= other_segments and (own_segments or own_pages <= set(other.slide_pages)):
-                    subsumed = True
-                    break
-            if not subsumed:
-                kept.append(entry)
-        return kept
 
     # ------------------------------------------------------------------ convenience
 
