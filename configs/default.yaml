@@ -31,6 +31,7 @@ asr:
   num_beams: 1
   max_new_tokens: 224
   sub_segment_timestamps: true   # split each VAD chunk into phrase-level segments via Whisper timestamp tokens
+  max_subsegment_sec: 12.0       # phrases longer than this are cut at sentence ends (times interpolated)
   min_confidence: 0.0     # drop segments whose mean token probability is below this (0 disables)
   prompt_prefix: "This is a university computer science lecture. Key terms:"
   prompt_max_terms: 40

@@ -1,5 +1,5 @@
 # LectureSync-ASR - pinned to the versions the test suite was last run against
-# (Python 3.12, macOS 15+/Apple Silicon). Linux + CUDA and CPU-only work with the same pins.
+# (Python 3.12 on Apple Silicon). Linux + CUDA and CPU-only installs use the same pins.
 
 # --- core deep learning stack
 torch==2.15.0
