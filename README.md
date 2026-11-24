@@ -125,7 +125,7 @@ Requirements: Python 3.12 (the pinned versions in `requirements.txt` were tested
 video containers.
 
 ```bash
-git clone <your-fork-url> LectureSync-ASR
+git clone https://github.com/KristianLi/LectureSync-ASR.git
 cd LectureSync-ASR
 python3 -m venv .venv
 source .venv/bin/activate

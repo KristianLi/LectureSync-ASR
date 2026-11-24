@@ -115,7 +115,7 @@ D[i, p] = S[i, p] + max_{q <= p} ( D[i-1, q] - lambda * pen(p - q) )
 自带的 `afconvert` 解码。Linux 上读取视频容器需要安装 `ffmpeg`。
 
 ```bash
-git clone <your-fork-url> LectureSync-ASR
+git clone https://github.com/KristianLi/LectureSync-ASR.git
 cd LectureSync-ASR
 python3 -m venv .venv
 source .venv/bin/activate
