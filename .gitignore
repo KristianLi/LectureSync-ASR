@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Generated artefacts
+outputs/
+checkpoints/
+eval/results/
+*.log
+
+# Local media and model caches
+data/
+.cache/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

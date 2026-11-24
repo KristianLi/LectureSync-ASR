@@ -1,0 +1,91 @@
+# LectureSync-ASR default configuration.
+# Every value can be overridden from the CLI with dotted keys, e.g.
+#   python -m src.pipeline --audio a.mp4 --pdf s.pdf --set asr.model_name=openai/whisper-tiny
+
+runtime:
+  device: auto            # auto | mps | cuda | cpu
+  dtype: auto             # auto | float32 | float16 (float16 on MPS is probed and falls back to float32)
+  log_level: INFO
+  work_dir: outputs       # rendered slides, normalised audio, exported notes
+
+audio:
+  sample_rate: 16000      # Whisper and Silero VAD both expect 16 kHz mono
+
+vad:
+  backend: auto           # auto | silero_hub | silero_pip | energy
+  hub_repo: snakers4/silero-vad
+  threshold: 0.5          # speech probability needed to open a segment
+  neg_threshold: 0.35     # probability below which an open segment closes (hysteresis)
+  min_speech_sec: 0.25    # discard blips shorter than this
+  min_silence_sec: 0.8    # pauses shorter than this are merged into the surrounding speech
+  max_segment_sec: 30.0   # Whisper's receptive field; longer regions are cut at the quietest frame
+  speech_pad_sec: 0.1     # context kept on both sides of every segment
+
+asr:
+  model_name: openai/whisper-small
+  language: en
+  task: transcribe
+  lora_checkpoint: null   # path to a PEFT adapter directory produced by src/train_lora.py
+  merge_lora: true        # fold LoRA deltas into the base weights for faster inference
+  batch_size: 8
+  num_beams: 1
+  max_new_tokens: 224
+  sub_segment_timestamps: true   # split each VAD chunk into phrase-level segments via Whisper timestamp tokens
+  min_confidence: 0.0     # drop segments whose mean token probability is below this (0 disables)
+  prompt_prefix: "This is a university computer science lecture. Key terms:"
+  prompt_max_terms: 40
+  prompt_max_tokens: 120  # Whisper keeps at most 223 prompt tokens; stay well below
+
+aligner:
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 64
+  context_window: 1       # neighbours (each side) a short utterance may borrow before embedding
+  context_min_words: 12   # only segments shorter than this borrow context
+  lexical_weight: 0.25    # blend of TF-IDF cosine into the semantic similarity (0 disables)
+  jump_penalty: 0.12      # lambda: cost of advancing to the next slide
+  skip_penalty: 0.5       # extra cost, in units of lambda, for every slide skipped in one jump
+  render_dpi: 150
+
+vocab:
+  top_k: 60               # maximum number of vocabulary cards per lecture
+  max_glossary_terms: 40  # terms pulled from the slides for the Whisper prompt
+  include_slide_only: true  # keep core terms that appear on slides but were never heard
+  min_phrase_chars: 5
+
+lora:
+  base_model: openai/whisper-small
+  dataset: edinburghcstr/edacc
+  train_split: validation   # EdAcc ships only validation/test splits; train on validation, report on test
+  eval_split: test
+  text_column: text
+  audio_column: audio
+  language: en
+  task: transcribe
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: [q_proj, v_proj]
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  warmup_steps: 50
+  max_steps: 1000
+  batch_size: 8
+  grad_accum_steps: 2       # effective batch = batch_size * grad_accum_steps
+  max_grad_norm: 1.0
+  precision: auto           # auto | fp16 | bf16 | fp32
+  max_audio_sec: 30.0
+  min_audio_sec: 1.0
+  max_label_tokens: 448
+  logging_steps: 10
+  eval_steps: 200
+  eval_samples: 64
+  save_steps: 200
+  seed: 42
+  output_dir: checkpoints/whisper-small-lora-edacc
+
+benchmark:
+  warmup_runs: 3
+  measured_runs: 20
+  clip_sec: 30.0
+  decode_tokens: 64         # fixed decode length used when no real audio clip is supplied
+  results_dir: eval/results
