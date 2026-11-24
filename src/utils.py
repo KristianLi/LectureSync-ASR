@@ -347,6 +347,25 @@ def _load_with_ffmpeg(path: Path, sample_rate: int) -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
+def _load_with_pyav(path: Path, sample_rate: int) -> np.ndarray:
+    """Decode with PyAV (bundled FFmpeg libraries): any container, no external binary."""
+    import av
+
+    chunks = []
+    with av.open(str(path)) as container:
+        if not container.streams.audio:
+            raise RuntimeError("file has no audio stream")
+        resampler = av.AudioResampler(format="flt", layout="mono", rate=sample_rate)
+        for frame in container.decode(container.streams.audio[0]):
+            for out in resampler.resample(frame):
+                chunks.append(out.to_ndarray().reshape(-1))
+        for out in resampler.resample(None):  # flush
+            chunks.append(out.to_ndarray().reshape(-1))
+    if not chunks:
+        raise RuntimeError("no audio frames decoded")
+    return np.concatenate(chunks).astype(np.float32, copy=False)
+
+
 def _load_with_afconvert(path: Path, sample_rate: int) -> np.ndarray:
     """Decode through macOS CoreAudio (``afconvert``), so .m4a/.mp4 work without ffmpeg."""
     import tempfile
@@ -379,8 +398,9 @@ def load_audio(path: PathLike, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     """Decode an audio or video file to a mono ``float32`` waveform in ``[-1, 1]``.
 
     Decoder order: ``soundfile`` for PCM-style containers and MP3, then the ``ffmpeg``
-    CLI when installed (broadest format coverage), then macOS ``afconvert`` (CoreAudio,
-    handles ``.m4a``/``.mp4`` with no extra install), then ``librosa``.
+    CLI when installed, then PyAV (FFmpeg libraries bundled in the wheel, so ``.m4a`` /
+    ``.mp4`` / ``.mkv`` work on every platform without installing anything), then macOS
+    ``afconvert`` and finally ``librosa``.
 
     Args:
         path: Media file (``.wav``, ``.mp3``, ``.m4a``, ``.mp4`` ...).
@@ -399,6 +419,7 @@ def load_audio(path: PathLike, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
         decoders.append(("soundfile", _load_with_soundfile))
     if ffmpeg_available():
         decoders.append(("ffmpeg", _load_with_ffmpeg))
+    decoders.append(("pyav", _load_with_pyav))
     if shutil.which("afconvert") is not None:
         decoders.append(("afconvert", _load_with_afconvert))
     decoders.append(("librosa", _load_with_librosa))
@@ -413,7 +434,7 @@ def load_audio(path: PathLike, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
             return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
         except Exception as exc:  # noqa: BLE001 - try the next decoder
             errors.append(f"{name}: {exc}")
-    hint = "" if ffmpeg_available() else " Installing ffmpeg (`brew install ffmpeg`) adds support for more formats."
+    hint = "" if ffmpeg_available() else " Installing ffmpeg may add support for this format."
     raise RuntimeError(f"Could not decode {path.name}. Tried " + "; ".join(errors) + "." + hint)
 
 

@@ -10,10 +10,11 @@ accelerate==1.16.0
 sentence-transformers==6.3.0
 datasets==5.2.0
 
-# --- audio
+# --- audio and video decoding
 silero-vad==6.3
 librosa==1.0.1
 soundfile==0.14.0
+av==19.0.2            # PyAV: bundled FFmpeg libraries for .mp4/.m4a audio and video key frames
 
 # --- documents, UI, evaluation
 pymupdf==2.1

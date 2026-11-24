@@ -17,7 +17,8 @@ where slide 23 was explained" in a 90-minute recording means scrubbing a progres
 LectureSync-ASR takes a recording (or video) and the slide deck and produces, entirely
 on your own machine:
 
-- a transcript in which every sentence is attached to the slide it explains,
+- a transcript in which every sentence is attached to the slide it explains, matched
+  from what is said and, when the recording is a screen capture, from what is on screen,
 - CS/AI terminology highlighted, with the timestamp and sentence where each term is said,
 - a web workbench where choosing a slide cues the audio to that slide, with
   0.75x / 1.0x / 1.25x playback for intensive listening,
@@ -35,6 +36,7 @@ Hugging Face Hub / GitHub on first use; after that the tool runs offline
 | VAD | Silero VAD through `torch.hub`, with offline fallbacks (hub cache -> `silero-vad` wheel -> energy detector). Pauses under 0.8 s are merged; segments are capped at 30 s and cut at the quietest frame. |
 | ASR | Hugging Face Whisper (`openai/whisper-small` by default), optional PEFT LoRA adapter, slide terminology injected via `prompt_ids`, phrase-level timestamps, per-segment confidence. |
 | Alignment | MiniLM sentence embeddings, an `N x M` cosine-similarity matrix and a monotonic dynamic program with a jump penalty. |
+| Visual alignment | For video input, key frames are matched against slide renderings (normalised correlation after locating the slide region in the frame). The picture then decides which slide is shown, including look-alike animation pages and moves back to earlier slides; the transcript fills the gaps. |
 | Vocabulary | Built-in CS/AI lexicon and academic word list, RAKE-style noun phrases and TF-IDF over slides; each term carries timestamps and its spoken sentence. |
 | Fine-tuning | Plain PyTorch loop with LoRA on `q_proj`/`v_proj`, gradient accumulation, `fp16`/`bf16` autocast, sized for a free Colab T4. |
 | Evaluation | WER and technical-term recall (base vs. LoRA, with and without glossary prompt); latency, RTF and peak RSS with correct MPS/CUDA synchronisation. |
@@ -54,6 +56,9 @@ flowchart LR
     T --> E["aligner.SlideAligner<br/>MiniLM embeddings"]
     D --> E
     E --> S["Similarity matrix S (N x M)"]
+    A -. "video input" .-> VF["visual.py<br/>key frames vs. slide renderings"]
+    D --> VF
+    VF -. "which slide is on screen" .-> DP
     S --> DP["Monotonic DP<br/>p0 <= p1 <= ... <= pN-1"]
     DP --> R["Per-slide transcript"]
     R --> X["vocab.extract<br/>terms + timestamps + context"]
@@ -64,10 +69,11 @@ flowchart LR
 
 | Module | Responsibility |
 | --- | --- |
-| `src/utils.py` | Config loading, `DeviceManager`, GPU-synchronised timing, audio decoding (soundfile / ffmpeg / macOS `afconvert`), logging |
+| `src/utils.py` | Config loading, `DeviceManager`, GPU-synchronised timing, audio decoding (soundfile / ffmpeg / PyAV / macOS `afconvert`), logging |
 | `src/vad.py` | Speech segmentation: `SpeechSegment(start_sec, end_sec, audio_tensor)` |
 | `src/asr.py` | Whisper inference, LoRA loading, glossary prompt, timestamps, confidence |
-| `src/aligner.py` | PDF text/image extraction, embeddings, similarity matrix, monotonic DP |
+| `src/aligner.py` | PDF text/image extraction, embeddings, similarity matrix, monotonic DP, fusion with visual evidence |
+| `src/visual.py` | Key-frame decoding (PyAV), slide-region detection, frame-to-slide similarity |
 | `src/vocab.py` | Glossary for prompting, study vocabulary, highlighting, term-recall metric |
 | `src/pipeline.py` | Orchestration of the stages, Markdown export, CLI |
 | `src/train_lora.py` | LoRA fine-tuning |
@@ -99,6 +105,34 @@ slide ("we will see transformers later"). The monotonic constraint rules out goi
 back, and the jump penalty makes moving forward cost something, so the path advances
 only when the following segments keep supporting the new slide.
 
+### When the video shows the slides
+
+Text has a hard limit: several consecutive slides often carry the same words and differ
+only in a figure (a worked example built up step by step). No similarity measure over
+text can tell them apart. If the input is a screen recording, the answer is in the
+picture, so `src/visual.py` adds a second channel:
+
+1. Only key frames are decoded (about one second for an hour of 720p video). Where two
+   neighbouring key frames show different slides, the frames in between are decoded too,
+   which locates the page turn to about a second.
+2. The slide rarely fills the frame, so a coarse-to-fine search finds the rectangle
+   whose content matches the deck best across a sample of frames.
+3. Each frame is compared with a rendering of every slide by zero-mean normalised
+   correlation. A frame showing a slide scores above 0.95 for it; a camera shot or a
+   demo scores low for every slide and counts as "no evidence".
+
+The aligner then optimises `S_text + w * V`, where `V[i, p]` says how clearly slide `p`
+is on screen while segment `i` is spoken. Three rules keep the two sources honest:
+
+- where the picture is decisive it is binding: only the slides it supports stay eligible,
+- going back to an earlier slide is allowed (at a cost) only into a segment whose picture
+  supports it; text alone never justifies a move back,
+- if the slides are on screen for most of the recording, speech during the remaining
+  gaps stays with the slide shown last instead of drifting on text similarity.
+
+Audio files, and videos whose picture never shows the slides (a camera pointed at the
+lecturer), fall back to the text-only alignment automatically.
+
 ### Design decisions
 
 - **Confidence without `generate` internals.** The return format of Whisper's
@@ -119,11 +153,8 @@ only when the following segments keep supporting the new slide.
 ## Quick start
 
 Requirements: Python 3.12 (the pinned versions in `requirements.txt` were tested on
-3.12) and about 1.5 GB of disk space for model weights.
-`ffmpeg` is optional: `.wav`/`.flac`/`.mp3` decode through `soundfile`, and on macOS
-`.m4a`/`.mp4` decode through the built-in `afconvert`. On Linux install `ffmpeg` to read
-video containers.
-
+3.12) and about 1.5 GB of disk space for model weights. No system `ffmpeg` is needed:
+video and compressed audio are decoded with PyAV, whose wheel bundles the FFmpeg libraries.
 ```bash
 git clone https://github.com/KristianLi/LectureSync-ASR.git
 cd LectureSync-ASR
@@ -133,7 +164,7 @@ pip install -r requirements.txt
 ```
 
 Verify the installation (generates a mock 2-page slide deck and test audio, then runs
-the whole pipeline; about 20 s on an M4 after the models are cached):
+the whole pipeline; under a minute on an M4 after the models are cached):
 
 ```bash
 pytest
@@ -193,6 +224,12 @@ overridden with `--config my.yaml` or `--set section.key=value`.
 | `aligner.jump_penalty` | `0.12` | `lambda` in the objective above |
 | `aligner.skip_penalty` | `0.5` | Extra cost per skipped slide, in units of `lambda` |
 | `aligner.lexical_weight` | `0.25` | TF-IDF share of the similarity |
+| `visual.enabled` | `true` | Look for the slides in the picture when the input is a video |
+| `visual.min_region_score` | `0.75` | Below this the video is treated as not showing the slides |
+| `visual.weight` | `1.0` | Weight of the visual score added to the text similarity |
+| `visual.backward_penalty` | `2.0` | Cost, in units of `lambda`, of going back to an earlier slide |
+| `visual.hold_coverage` | `0.6` | From this share of covered segments, gaps keep the slide shown last |
+| `asr.filter_hallucinations` | `true` | Drop decoder loops and stock phrases invented on non-speech audio |
 | `lora.*` | | Rank, alpha, learning rate, batch size, accumulation, precision |
 
 ## Fine-tuning Whisper with LoRA
@@ -250,7 +287,37 @@ driver memory, which the script reports separately (`mps_driver_mb`).
 
 Cells marked `TBD` or `TBD-M1` are **placeholders, not measurements**: `TBD-M1` = to be
 measured on an M1 MacBook Air, `TBD` = to be measured on the machine that runs the
-accuracy benchmark. The Mac mini (M4) rows of the latency table are measured values.
+accuracy benchmark. The slide-alignment table and the Mac mini (M4) rows of the latency
+table are measured values.
+
+**Slide alignment on a real lecture** - one private 55-minute lecture recorded as a
+screen capture, 47 slides, `openai/whisper-small` transcript. The reference is the slide
+on screen, identified by frame matching at the 271 key frames in which a slide is clearly
+visible. These are measured values.
+
+| Method | Correct slide | Within 1 slide | Mean error (slides) | Slides located |
+| --- | ---: | ---: | ---: | ---: |
+| Time-proportional pacing (ignores content) | 14% | 25% | 5.5 | 47 / 47 |
+| Per-segment `argmax` (no DP) | 13% | 23% | 11.0 | 43 / 47 |
+| Monotonic DP, text only | 33% | 56% | 5.6 | 20 / 47 |
+| Monotonic DP, text + video frames | 88% | 90% | 1.6 | 42 / 47 |
+
+How to read this:
+
+- The DP more than doubles the accuracy of per-segment matching, but text alone tops
+  out at about a third: this deck has long runs of slides with identical wording, and
+  the lecturer went back to an earlier slide several times, which a strictly monotonic
+  path cannot follow.
+- The last row is **not an independent accuracy figure**: the reference and the method
+  both rely on frame matching, so it mostly shows that the fused path follows the
+  picture (the remaining disagreement is concentrated on look-alike slides, where the
+  low-resolution reference is itself uncertain). The independent check is the test
+  suite, which builds a synthetic screen recording with a known page timeline,
+  including look-alike pages and a move back, and requires every segment to land on the
+  true page.
+- One lecture is one data point. Two further recordings from the same course were
+  filmed by a room camera, so the visual channel correctly switched itself off and
+  their text-only alignment could not be scored.
 
 **Recognition accuracy** - `openai/whisper-small`, EdAcc `test`, 200 utterances
 (`eval/benchmark.py accuracy ... --with-prompt`)
@@ -291,7 +358,7 @@ To fill a row, run the latency command on that machine (add `--device cpu` or
 
 ## Tests
 
-`pytest` runs 14 tests in `tests/test_pipeline.py`:
+`pytest` runs 20 tests in `tests/test_pipeline.py`:
 
 - generated fixtures: a two-page CS deck (PyMuPDF) and a speech-shaped WAV (NumPy + soundfile),
 - VAD rules: a 0.4 s pause is merged, a 1.5 s pause splits, 70 s of speech is cut into
@@ -301,6 +368,12 @@ To fill a row, run the latency command on that machine (add `--device cpu` or
 - the full `VAD -> ASR -> Aligner -> Vocab` chain on the auto-detected device and on
   CPU, asserting output schemas and that models and tensors sit on the expected device,
 - LoRA adapter loading (merged and as a live adapter),
+- the visual channel: a synthetic pillar-boxed screen recording with a known page
+  timeline (three pages that share every word, a move back to an earlier page, a stretch
+  without slides) must be matched frame by frame, must fix an alignment that text cannot
+  solve, and must run end to end from a video file with an audio track; a deck that is
+  not the one in the video must be rejected,
+- the hallucination filter and the cleaning of slide text (footers, URLs),
 - on macOS, a spoken two-topic lecture synthesised with `say`: both slides must be
   found, the page turn must fall at the topic change, and terms must carry timestamps
   on the correct slide.
@@ -310,8 +383,18 @@ tests the default model.
 
 ## Limitations
 
-- **Monotonic assumption.** A lecturer who goes back to an earlier slide is not
-  modelled; that narration stays with the current slide.
+- **Text-only alignment is weak on decks with look-alike slides.** On the real lecture
+  above it found the correct slide for about a third of the time. Use a screen recording
+  when one exists.
+- **Camera recordings get no visual help.** When the video shows the room rather than
+  the screen, the slide cannot be recognised and the text-only alignment is used. A
+  projected slide filmed at an angle would need feature matching and a homography, which
+  is not implemented.
+- **Monotonic assumption (text-only mode).** Without visual evidence, a lecturer who
+  goes back to an earlier slide is not modelled; that narration stays with the current
+  slide.
+- **Speech after the lecture.** Students talking after the lecturer has finished is
+  still transcribed (at low confidence) and attached to the last slide.
 - **Bridge sentences.** A content-free sentence at a slide change ("okay, next topic")
   can land on either side of the page turn.
 - **Image-only slides** have no text to match and are skipped unless neighbouring
@@ -328,7 +411,9 @@ tests the default model.
 
 - *First run is slow or fails offline.* Models are downloaded on first use: Whisper
   small (about 1 GB), MiniLM (about 90 MB), Silero VAD (about 2 MB).
-- *`.m4a`/`.mp4` cannot be decoded on Linux.* Install `ffmpeg`.
+- *The visual channel did not switch on.* The log line `Video does not show the slides`
+  means no region of the picture matched the deck: check that the PDF is the deck used
+  in that lecture and that the recording is the screen stream, not the room camera.
 - *`torch.hub` certificate errors on macOS.* The VAD loader points OpenSSL at the
   `certifi` bundle automatically; if the hub is still unreachable it falls back to the
   `silero-vad` wheel, and then to an energy detector, and logs which backend is used.
@@ -346,7 +431,8 @@ LectureSync-ASR/
 │   ├── utils.py        # device manager, audio loading, config, logging
 │   ├── vad.py          # Silero VAD wrapper
 │   ├── asr.py          # Whisper + LoRA + glossary prompt
-│   ├── aligner.py      # PDF extraction, embeddings, monotonic DP
+│   ├── aligner.py      # PDF extraction, embeddings, monotonic DP, visual fusion
+│   ├── visual.py       # video key frames vs. slide renderings
 │   ├── vocab.py        # terminology extraction
 │   ├── pipeline.py     # orchestration, Markdown export, CLI
 │   └── train_lora.py   # LoRA fine-tuning

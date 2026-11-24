@@ -56,9 +56,12 @@ class LectureResult:
             ``confidence`` and the aligned zero-based ``page``.
         vocabulary: Ranked study vocabulary.
         glossary: Terms injected into the Whisper prompt.
-        page_ranges: ``(start_sec, end_sec)`` narrated for every slide, ``None`` if skipped.
+        page_ranges: ``(start_sec, end_sec)`` of the first narration of every slide,
+            ``None`` if skipped.
         timings: Wall-clock seconds per stage.
         meta: Model names, device and backend information.
+        page_visits: Every ``(start_sec, end_sec)`` stretch spent on each slide; more than
+            one entry means the lecturer came back to it.
     """
 
     audio_path: Path
@@ -71,6 +74,14 @@ class LectureResult:
     page_ranges: List[Optional[tuple]]
     timings: Dict[str, float] = field(default_factory=dict)
     meta: Dict[str, Any] = field(default_factory=dict)
+    page_visits: List[List[tuple]] = field(default_factory=list)
+
+    def visits(self, page: int) -> List[tuple]:
+        """All stretches of narration for ``page`` (falls back to the first range)."""
+        if 0 <= page < len(self.page_visits) and self.page_visits[page]:
+            return list(self.page_visits[page])
+        span = self.page_ranges[page] if 0 <= page < len(self.page_ranges) else None
+        return [span] if span else []
 
     def segments_for_page(self, page: int) -> List[Dict[str, Any]]:
         """Transcript segments aligned to ``page``."""
@@ -98,6 +109,7 @@ class LectureResult:
                     "text": page.text,
                     "image_path": str(page.image_path) if page.image_path else None,
                     "range": list(self.page_ranges[page.index]) if self.page_ranges[page.index] else None,
+                    "visits": [list(visit) for visit in self.visits(page.index)],
                 }
                 for page in self.deck.pages
             ],
@@ -127,7 +139,7 @@ class LecturePipeline:
         self.sample_rate: int = int(self.config.get("audio", {}).get("sample_rate", 16_000))
         self.vad = VoiceActivityDetector(self.config.get("vad"), self.sample_rate)
         self.asr = WhisperASR(self.config.get("asr"), self.device_manager)
-        self.aligner = SlideAligner(self.config.get("aligner"), self.device_manager)
+        self.aligner = SlideAligner(self.config.get("aligner"), self.device_manager, self.config.get("visual"))
 
     def run(
         self,
@@ -194,9 +206,14 @@ class LecturePipeline:
         self.device_manager.synchronize()
         timings["asr_sec"] = time.perf_counter() - tick
 
-        report(0.82, "Aligning transcript to slides")
+        report(0.80, "Looking for the slides in the video")
         tick = time.perf_counter()
-        alignment = self.aligner.align(transcript, deck)
+        visual = self._visual_evidence(audio_path, pdf_path)
+        timings["visual_sec"] = time.perf_counter() - tick
+
+        report(0.84, "Aligning transcript to slides")
+        tick = time.perf_counter()
+        alignment = self.aligner.align(transcript, deck, visual)
         segments = attach_pages(transcript, alignment.assignments)
         self.device_manager.synchronize()
         timings["align_sec"] = time.perf_counter() - tick
@@ -213,6 +230,8 @@ class LecturePipeline:
             "lora_checkpoint": str(self.asr.lora_checkpoint) if self.asr.lora_checkpoint else None,
             "embedding_model": self.aligner.model_name,
             "vad_backend": self.vad.backend,
+            "alignment_mode": alignment.mode,
+            "visual": dict(visual_summary(visual), segment_coverage=round(alignment.visual_coverage, 3)),
             "prompt": prompt,
             "speech_chunks": len(speech),
             "real_time_factor": timings["total_sec"] / duration if duration > 0 else None,
@@ -229,10 +248,37 @@ class LecturePipeline:
             page_ranges=alignment.page_ranges,
             timings=timings,
             meta=meta,
+            page_visits=alignment.page_visits,
         )
+
+    def _visual_evidence(self, media_path: Path, pdf_path: Path) -> Optional[Any]:
+        """Match video frames to slides; ``None`` for audio files or when anything goes wrong.
+
+        The visual channel is an enhancement: a decoding problem must never stop the
+        transcript from being produced, so failures are logged and ignored.
+        """
+        visual_cfg = self.config.get("visual") or {}
+        if not bool(visual_cfg.get("enabled", True)):
+            return None
+        try:
+            from .visual import match_video_to_slides
+
+            return match_video_to_slides(media_path, pdf_path, visual_cfg)
+        except Exception as exc:  # noqa: BLE001 - optional stage
+            logger.warning("Visual slide matching skipped: %s", exc)
+            return None
 
 
 # --------------------------------------------------------------------------- notes export
+
+
+def visual_summary(evidence: Optional[Any]) -> Dict[str, Any]:
+    """Metadata describing the visual channel (``{"used": False}`` when it did not run)."""
+    if evidence is None:
+        return {"used": False}
+    from .visual import describe
+
+    return describe(evidence)
 
 
 def _table_cell(text: str) -> str:
@@ -262,7 +308,8 @@ def export_markdown(
         "",
         f"> Generated locally by LectureSync-ASR | duration {format_timestamp(result.duration)}"
         f" | {len(result.deck)} slides | {len(result.segments)} transcript segments"
-        f" | ASR `{result.meta.get('asr_model', 'whisper')}` on `{result.meta.get('device', 'cpu')}`",
+        f" | ASR `{result.meta.get('asr_model', 'whisper')}` on `{result.meta.get('device', 'cpu')}`"
+        f" | alignment: {result.meta.get('alignment_mode', 'text')}",
         "",
     ]
 
@@ -281,7 +328,11 @@ def export_markdown(
                     image_ref = str(Path(page.image_path).resolve())
             lines += [f"![Slide {page.index + 1}]({image_ref})", ""]
         if span is not None:
-            lines.append(f"**Narration:** {format_timestamp(span[0])} - {format_timestamp(span[1])}")
+            line = f"**Narration:** {format_timestamp(span[0])} - {format_timestamp(span[1])}"
+            later = result.visits(page.index)[1:]
+            if later:
+                line += " (shown again at " + ", ".join(format_timestamp(start) for start, _ in later[:6]) + ")"
+            lines.append(line)
         else:
             lines.append("**Narration:** _not discussed in the recording_")
         lines += ["", "### Transcript", ""]

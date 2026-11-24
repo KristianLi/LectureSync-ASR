@@ -48,6 +48,21 @@ aligner:
   skip_penalty: 0.5       # extra cost, in units of lambda, for every slide skipped in one jump
   render_dpi: 150
 
+visual:
+  enabled: true            # when the input is a video, look for the slides in the picture
+  frame_width: 640         # analysis resolution (frames are decoded at this size)
+  frame_height: 360
+  min_region_score: 0.75   # below this the video is treated as "slides not on screen" (camera recording)
+  min_visible_fraction: 0.05   # slides must be clearly visible in at least this share of frames
+  min_corr: 0.6            # frame/slide correlation below which a frame is no evidence at all
+  full_corr: 0.8           # correlation from which a frame counts as full evidence
+  temperature: 0.02        # sharpening of the per-frame slide scores (smaller = more decisive)
+  weight: 1.0              # weight of the visual score added to the text similarity
+  backward_penalty: 2.0    # cost (in units of lambda) of going back to an earlier slide
+  min_coverage: 0.2        # share of segments with visual evidence needed to allow going back
+  hold_coverage: 0.6       # above this share, speech without a slide on screen stays with the last slide shown
+  refine_step_sec: 1.0     # resolution with which page turns are located between key frames
+
 vocab:
   top_k: 60               # maximum number of vocabulary cards per lecture
   max_glossary_terms: 40  # terms pulled from the slides for the Whisper prompt

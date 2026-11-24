@@ -23,13 +23,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
 
 from .utils import DeviceManager, PathLike, get_logger
 from .vocab import clean_slide_texts
+
+if TYPE_CHECKING:  # imported lazily: PyAV is only needed when a video is supplied
+    from .visual import VisualEvidence
 
 logger = get_logger(__name__)
 
@@ -120,6 +123,8 @@ class SlideDeck:
 
 # --------------------------------------------------------------------------- dynamic programming
 
+_RULED_OUT = -1.0e6  # similarity assigned to slides that the video frame rules out
+
 
 def jump_penalty(delta: np.ndarray, skip_penalty: float = 0.5) -> np.ndarray:
     """Cost (in units of ``lambda``) of moving ``delta`` pages forward.
@@ -132,8 +137,33 @@ def jump_penalty(delta: np.ndarray, skip_penalty: float = 0.5) -> np.ndarray:
     return np.where(delta < 0, np.inf, cost)
 
 
+def transition_costs(
+    n_pages: int, jump_lambda: float, skip_penalty: float, backward_penalty: Optional[float] = None
+) -> np.ndarray:
+    """Matrix ``T[q, p]``: cost of moving from page ``q`` to page ``p`` between two segments.
+
+    Forward moves cost ``lambda * jump_penalty(p - q)``. Backward moves are forbidden
+    (``+inf``) unless ``backward_penalty`` is given. In that relaxed form any move back
+    costs a flat ``lambda * backward_penalty``, and a forward jump never costs more than
+    that either: returning to an outline slide twenty pages earlier, and then jumping
+    forward again to where the lecture was, are single actions for the lecturer.
+    """
+    page_ids = np.arange(n_pages)
+    delta = page_ids[None, :] - page_ids[:, None]
+    # Set forbidden entries explicitly: lambda * inf would be NaN for lambda == 0.
+    forward = jump_lambda * jump_penalty(np.maximum(delta, 0), skip_penalty)
+    if backward_penalty is None:
+        return np.where(delta < 0, np.inf, forward)
+    flat = jump_lambda * float(backward_penalty)
+    return np.where(delta < 0, flat, np.minimum(forward, max(flat, jump_lambda)))
+
+
 def monotonic_dp_align(
-    similarity: np.ndarray, jump_lambda: float = 0.12, skip_penalty: float = 0.5
+    similarity: np.ndarray,
+    jump_lambda: float = 0.12,
+    skip_penalty: float = 0.5,
+    backward_penalty: Optional[float] = None,
+    relaxed_steps: Optional[Sequence[bool]] = None,
 ) -> List[int]:
     """Viterbi-style monotonic alignment of ``N`` segments to ``M`` pages.
 
@@ -148,10 +178,17 @@ def monotonic_dp_align(
         similarity: ``(N, M)`` matrix; larger means segment ``i`` matches page ``p`` better.
         jump_lambda: Weight ``lambda`` of the jump penalty.
         skip_penalty: Extra per-skipped-page cost, see :func:`jump_penalty`.
+        backward_penalty: ``None`` (default) enforces strict monotonicity. A number
+            relaxes the constraint: going back to any earlier page costs
+            ``lambda * backward_penalty``. Only used when video frames show which slide is
+            on screen, because text alone cannot justify a move back.
+        relaxed_steps: Optional flags, one per segment. When given, the relaxed
+            transitions apply only when moving *into* a flagged segment; every other
+            step stays strictly monotonic.
 
     Returns:
-        Page index per segment, guaranteed non-decreasing. Complexity is ``O(N * M^2)``
-        time (vectorised over ``M^2``) and ``O(N * M)`` memory.
+        Page index per segment; non-decreasing unless ``backward_penalty`` is set.
+        Complexity is ``O(N * M^2)`` time (vectorised over ``M^2``) and ``O(N * M)`` memory.
     """
     scores = np.asarray(similarity, dtype=np.float64)
     if scores.ndim != 2:
@@ -163,15 +200,16 @@ def monotonic_dp_align(
         raise ValueError("Cannot align against an empty slide deck")
 
     page_ids = np.arange(n_pages)
-    # transition[q, p] = lambda * pen(p - q); +inf where p < q forbids going backwards.
-    # The forbidden entries are set explicitly: lambda * inf would be NaN for lambda == 0.
-    delta = page_ids[None, :] - page_ids[:, None]
-    transition = np.where(delta < 0, np.inf, jump_lambda * jump_penalty(np.maximum(delta, 0), skip_penalty))
+    strict = transition_costs(n_pages, jump_lambda, skip_penalty)  # [q, p]
+    relaxed = strict if backward_penalty is None else transition_costs(n_pages, jump_lambda, skip_penalty, backward_penalty)
+    if relaxed_steps is not None and len(relaxed_steps) != n_segments:
+        raise ValueError("relaxed_steps must have one entry per segment")
 
     best = np.empty((n_segments, n_pages), dtype=np.float64)
     backpointer = np.zeros((n_segments, n_pages), dtype=np.int64)
     best[0] = scores[0] - jump_lambda * jump_penalty(page_ids, skip_penalty)
     for i in range(1, n_segments):
+        transition = relaxed if (relaxed_steps is None or relaxed_steps[i]) else strict
         candidates = best[i - 1][:, None] - transition  # [q, p]
         backpointer[i] = np.argmax(candidates, axis=0)
         best[i] = scores[i] + candidates[backpointer[i], page_ids]
@@ -191,16 +229,24 @@ class AlignmentResult:
     """Outcome of aligning a transcript to a slide deck.
 
     Attributes:
-        assignments: Page index per transcript segment (non-decreasing).
+        assignments: Page index per transcript segment (non-decreasing for text-only
+            alignment; may step back when video evidence shows the lecturer did).
         similarity: The ``(N, M)`` similarity matrix that was optimised.
-        page_ranges: For every page, ``(start_sec, end_sec)`` of its narration or ``None``.
+        page_ranges: For every page, ``(start_sec, end_sec)`` of its first narration, or
+            ``None`` if the page was never reached.
         objective: Value of the DP objective for ``assignments``.
+        page_visits: For every page, all ``(start_sec, end_sec)`` stretches spent on it.
+        visual_coverage: Fraction of segments for which video frames identified a slide.
+        mode: ``"text"`` or ``"text+visual"``.
     """
 
     assignments: List[int]
     similarity: np.ndarray
     page_ranges: List[Optional[tuple]] = field(default_factory=list)
     objective: float = 0.0
+    page_visits: List[List[tuple]] = field(default_factory=list)
+    visual_coverage: float = 0.0
+    mode: str = "text"
 
 
 class SlideAligner:
@@ -213,9 +259,20 @@ class SlideAligner:
     """
 
     def __init__(
-        self, config: Optional[Mapping[str, Any]] = None, device_manager: Optional[DeviceManager] = None
+        self,
+        config: Optional[Mapping[str, Any]] = None,
+        device_manager: Optional[DeviceManager] = None,
+        visual_config: Optional[Mapping[str, Any]] = None,
     ) -> None:
         cfg = dict(config or {})
+        vis = dict(visual_config or {})
+        self.visual_weight: float = float(vis.get("weight", 1.0))
+        self.visual_min_corr: float = float(vis.get("min_corr", 0.6))
+        self.visual_full_corr: float = float(vis.get("full_corr", 0.8))
+        self.visual_temperature: float = float(vis.get("temperature", 0.02))
+        self.visual_backward_penalty: float = float(vis.get("backward_penalty", 2.0))
+        self.visual_min_coverage: float = float(vis.get("min_coverage", 0.2))
+        self.visual_hold_coverage: float = float(vis.get("hold_coverage", 0.6))
         self.model_name: str = str(cfg.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2"))
         self.batch_size: int = int(cfg.get("batch_size", 64))
         self.context_window: int = int(cfg.get("context_window", 1))
@@ -324,39 +381,97 @@ class SlideAligner:
 
     # ------------------------------------------------------------------ alignment
 
-    def align(self, segments: Sequence[Mapping[str, Any]], deck: SlideDeck) -> AlignmentResult:
+    def align(
+        self,
+        segments: Sequence[Mapping[str, Any]],
+        deck: SlideDeck,
+        visual: Optional["VisualEvidence"] = None,
+    ) -> AlignmentResult:
         """Assign a slide to every transcript segment.
+
+        Without ``visual`` this is the strictly monotonic text alignment. With it, the
+        optimised matrix becomes ``S_text + visual_weight * V`` where ``V[i, p]`` in
+        ``[0, 1]`` says how clearly slide ``p`` is on screen while segment ``i`` is spoken
+        (see :meth:`src.visual.VisualEvidence.segment_scores`). Segments without visual
+        evidence (camera shot, demo, blank screen) are decided by the text and by their
+        neighbours. If enough of the lecture is covered, moving back to an earlier slide is
+        allowed at a cost, but only into a segment whose picture supports it; stretches
+        without visual evidence stay strictly monotonic, or, when the slides are on screen
+        for most of the recording (``hold_coverage``), simply keep the slide shown last.
 
         Args:
             segments: Transcript segments with at least ``text``, ``start`` and ``end``.
             deck: The slide deck to align against.
+            visual: Optional frame/slide similarity from :func:`src.visual.match_video_to_slides`.
 
         Returns:
             :class:`AlignmentResult`; ``assignments[i]`` is the page of ``segments[i]``.
         """
         texts = [str(seg.get("text", "")) for seg in segments]
+        starts = [float(seg["start"]) for seg in segments]
+        ends = [float(seg["end"]) for seg in segments]
         # Footers, course codes and URLs repeat on every page and only add noise to the match.
         similarity = self.similarity_matrix(texts, clean_slide_texts(deck.texts))
-        assignments = monotonic_dp_align(similarity, self.jump_lambda, self.skip_penalty)
 
-        page_ranges: List[Optional[tuple]] = [None] * len(deck)
-        for seg, page in zip(segments, assignments):
-            start, end = float(seg["start"]), float(seg["end"])
-            current = page_ranges[page]
-            page_ranges[page] = (start, end) if current is None else (min(current[0], start), max(current[1], end))
+        backward: Optional[float] = None
+        relaxed_steps: Optional[List[bool]] = None
+        coverage, mode = 0.0, "text"
+        if visual is not None and len(segments) and visual.similarity.shape[1] == len(deck):
+            evidence = visual.segment_scores(
+                starts, ends, self.visual_min_corr, self.visual_full_corr, self.visual_temperature
+            )
+            supported = evidence.max(axis=1) > 0.5
+            coverage = float(supported.mean())
+            similarity = (similarity + self.visual_weight * evidence).astype(np.float32)
+            # Where the picture is decisive it is binding: only the slides it supports
+            # (the best match and its look-alikes) remain eligible. Without this the path
+            # could leave the slide on screen just to collect text similarity later on.
+            ruled_out = supported[:, None] & (evidence < 0.25 * evidence.max(axis=1, keepdims=True))
+            similarity[ruled_out] = _RULED_OUT
+            mode = "text+visual"
+            if coverage >= self.visual_min_coverage:
+                backward = self.visual_backward_penalty
+                relaxed_steps = [bool(flag) for flag in supported]
+        assignments = monotonic_dp_align(
+            similarity, self.jump_lambda, self.skip_penalty, backward, relaxed_steps
+        )
+        if relaxed_steps is not None and coverage >= self.visual_hold_coverage:
+            # The recording shows the slides nearly all the time. In the remaining gaps
+            # (a demo, a blank screen, questions after the last slide) speech stays with
+            # the slide shown last instead of drifting on text similarity alone.
+            held: Optional[int] = None
+            for index, flag in enumerate(relaxed_steps):
+                if flag:
+                    held = assignments[index]
+                elif held is not None:
+                    assignments[index] = held
 
+        page_visits: List[List[tuple]] = [[] for _ in range(len(deck))]
+        previous_page: Optional[int] = None
+        for page, start, end in zip(assignments, starts, ends):
+            if page == previous_page:
+                first, _ = page_visits[page][-1]
+                page_visits[page][-1] = (first, max(end, start))
+            else:
+                page_visits[page].append((start, end))
+            previous_page = page
+        page_ranges: List[Optional[tuple]] = [visits[0] if visits else None for visits in page_visits]
+
+        strict_costs = transition_costs(len(deck), self.jump_lambda, self.skip_penalty)
+        relaxed_costs = transition_costs(len(deck), self.jump_lambda, self.skip_penalty, backward)
         objective = 0.0
         previous = 0
         for index, page in enumerate(assignments):
-            objective += float(similarity[index, page])
-            objective -= self.jump_lambda * float(jump_penalty(np.array(page - previous), self.skip_penalty))
+            use_relaxed = index > 0 and relaxed_steps is not None and relaxed_steps[index]
+            costs = relaxed_costs if use_relaxed else strict_costs
+            objective += float(similarity[index, page]) - float(costs[previous, page])
             previous = page
         covered = sum(1 for r in page_ranges if r is not None)
         logger.info(
-            "Aligned %d segments to %d/%d slides (objective %.3f)",
-            len(assignments), covered, len(deck), objective,
+            "Aligned %d segments to %d/%d slides [%s, visual coverage %.0f%%] (objective %.3f)",
+            len(assignments), covered, len(deck), mode, 100 * coverage, objective,
         )  # fmt: skip
-        return AlignmentResult(assignments, similarity, page_ranges, objective)
+        return AlignmentResult(assignments, similarity, page_ranges, objective, page_visits, coverage, mode)
 
 
 def attach_pages(

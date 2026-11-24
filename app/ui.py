@@ -164,6 +164,17 @@ def render_vocab(result: LectureResult, page: Optional[int]) -> str:
     return f'<div class="ls-cards">{"".join(_vocab_card(entry, page) for entry in entries)}</div>'
 
 
+def alignment_note(result: LectureResult) -> str:
+    """One sentence on how slides were matched (video frames or transcript only)."""
+    visual = result.meta.get("visual") or {}
+    if visual.get("used"):
+        return (
+            f"video frames + transcript (slides visible in {100 * visual.get('slide_visible_fraction', 0):.0f}% "
+            "of the video)"
+        )
+    return "transcript only (no slides found in the picture, or audio-only input)"
+
+
 def page_choices(result: LectureResult) -> List[Tuple[str, int]]:
     """Dropdown entries such as ``3 / 12 - Gradient Descent (04:10)``."""
     choices: List[Tuple[str, int]] = []
@@ -222,6 +233,7 @@ def process_lecture(
         f"**Done.** {len(result.segments)} transcript segments aligned to {narrated} of {len(result.deck)} slides, "
         f"{len(result.vocabulary)} key terms. Processed {format_timestamp(result.duration)} of audio in "
         f"{result.timings['total_sec']:.1f} s (RTF {result.meta['real_time_factor']:.2f}) on {result.meta['device']}.\n\n"
+        f"**Slide matching:** {alignment_note(result)}\n\n"
         f"**Glossary injected into Whisper:** {', '.join(result.glossary[:12]) or 'none'}"
         f"{' ...' if len(result.glossary) > 12 else ''}\n\n**Files:** `{work_dir}`"
     )
@@ -244,6 +256,9 @@ def show_page(result: Optional[LectureResult], page: Optional[int]):
     slide = result.deck.pages[page]
     span = result.page_ranges[page]
     when = f"{format_timestamp(span[0])} - {format_timestamp(span[1])}" if span else "not narrated"
+    later = result.visits(page)[1:]
+    if later:
+        when += " (shown again at " + ", ".join(format_timestamp(start) for start, _ in later[:4]) + ")"
     info = f"**Slide {page + 1} of {len(result.deck)}** &nbsp;|&nbsp; narration {when} &nbsp;|&nbsp; {len(result.segments_for_page(page))} segments"
     image = str(slide.image_path) if slide.image_path else None
     return image, info, render_transcript(result, page), render_vocab(result, page)

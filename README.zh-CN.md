@@ -15,7 +15,8 @@
 
 LectureSync-ASR 输入一段录音（或视频）和对应课件，完全在本机生成：
 
-- 逐句转写，每句话都挂在它所讲解的那一页课件上；
+- 逐句转写，每句话都挂在它所讲解的那一页课件上：依据讲的内容匹配，如果回放是屏幕录制，还会依据
+  画面上显示的课件来匹配；
 - 自动高亮的 CS/AI 术语，并标出老师说出该词的时间戳和原句；
 - 一个网页工作台：选中某页课件，音频自动定位到该页的讲解起点，支持 0.75x / 1.0x / 1.25x
   三档倍速精听；
@@ -32,6 +33,7 @@ GitHub 下载一次，之后可完全离线运行（`HF_HUB_OFFLINE=1`）。
 | VAD | 通过 `torch.hub` 加载 Silero VAD，离线时依次回退（hub 缓存 -> `silero-vad` 安装包 -> 能量检测）。短于 0.8 s 的停顿会被合并；单段不超过 30 s，超长时在最安静的一帧切开。 |
 | ASR | Hugging Face Whisper（默认 `openai/whisper-small`），可选加载 PEFT LoRA 适配器，通过 `prompt_ids` 注入课件术语，输出短语级时间戳和每段置信度。 |
 | 对齐 | MiniLM 句向量、`N x M` 余弦相似度矩阵，以及带翻页惩罚的单调动态规划。 |
+| 画面对齐 | 输入为视频时，把关键帧与课件渲染图做匹配（先定位课件在画面中的区域，再算归一化相关）。此时由画面决定当前是哪一页，包括文字相同的动画页和往回翻页；没有画面证据的地方由转写文本补足。 |
 | 词汇 | 内置 CS/AI 核心词库与学术词表，结合 RAKE 式名词短语和课件 TF-IDF；每个词附带时间戳与原句。 |
 | 微调 | 纯 PyTorch 训练循环，对 `q_proj`/`v_proj` 做 LoRA，支持梯度累积与 `fp16`/`bf16` 混合精度，适配免费 Colab T4。 |
 | 评测 | WER 与专业术语召回率（原始模型对比 LoRA，是否使用术语提示）；推理延迟、RTF、峰值 RSS，计时前后正确同步 MPS/CUDA。 |
@@ -51,6 +53,9 @@ flowchart LR
     T --> E["aligner.SlideAligner<br/>MiniLM 向量"]
     D --> E
     E --> S["相似度矩阵 S (N x M)"]
+    A -. "视频输入" .-> VF["visual.py<br/>关键帧与课件渲染图比对"]
+    D --> VF
+    VF -. "画面上是哪一页" .-> DP
     S --> DP["单调动态规划<br/>p0 <= p1 <= ... <= pN-1"]
     DP --> R["逐页转写"]
     R --> X["vocab.extract<br/>术语 + 时间戳 + 语境"]
@@ -61,10 +66,11 @@ flowchart LR
 
 | 模块 | 职责 |
 | --- | --- |
-| `src/utils.py` | 配置加载、`DeviceManager`、带 GPU 同步的计时、音频解码（soundfile / ffmpeg / macOS `afconvert`）、日志 |
+| `src/utils.py` | 配置加载、`DeviceManager`、带 GPU 同步的计时、音频解码（soundfile / ffmpeg / PyAV / macOS `afconvert`）、日志 |
 | `src/vad.py` | 语音切分：`SpeechSegment(start_sec, end_sec, audio_tensor)` |
 | `src/asr.py` | Whisper 推理、LoRA 加载、术语提示、时间戳、置信度 |
-| `src/aligner.py` | PDF 文本与图像提取、向量编码、相似度矩阵、单调 DP |
+| `src/aligner.py` | PDF 文本与图像提取、向量编码、相似度矩阵、单调 DP、与画面证据融合 |
+| `src/visual.py` | 关键帧解码（PyAV）、课件区域定位、画面与课件的相似度 |
 | `src/vocab.py` | 提示用术语表、学习词汇、高亮、术语召回率指标 |
 | `src/pipeline.py` | 串联各阶段、导出 Markdown、命令行入口 |
 | `src/train_lora.py` | LoRA 微调 |
@@ -94,6 +100,28 @@ D[i, p] = S[i, p] + max_{q <= p} ( D[i-1, q] - lambda * pen(p - q) )
 跳。单调约束禁止回跳；翻页惩罚让“往前翻”有代价，因此只有后续片段持续支持新的一页时，路径
 才会前进。
 
+### 当视频里能看到课件时
+
+文本有一个硬上限：连续几页课件常常文字完全相同，只是图在变（逐步展开的例题）。任何基于文本的
+相似度都无法区分它们。如果输入是屏幕录制，答案就在画面里，所以 `src/visual.py` 增加了第二个
+通道：
+
+1. 只解码关键帧（一小时的 720p 视频约一秒）。相邻两个关键帧显示的课件不同时，再解码它们之间的
+   帧，把翻页时刻定位到一秒左右。
+2. 课件很少占满整个画面，所以先用由粗到细的搜索，找出在一批采样帧上与课件最吻合的矩形区域。
+3. 每一帧与每页课件的渲染图计算零均值归一化相关。显示某页课件的帧，对该页的得分通常在 0.95
+   以上；摄像机画面或现场演示对所有页得分都很低，视为“没有证据”。
+
+对齐器随后优化 `S_text + w * V`，其中 `V[i, p]` 表示片段 `i` 被说出时第 `p` 页在画面上有多清晰。
+三条规则保证两种信息各司其职：
+
+- 画面足够确定时具有约束力：只有画面支持的那几页可以被选中；
+- 往回翻到前面的页是允许的（有代价），但只能发生在画面支持的片段上；仅凭文本永远不会回跳；
+- 如果课件在录像的大部分时间里都在画面上，那么其余空档里的讲话归到最后显示的那一页，而不是
+  仅凭文本相似度漂移。
+
+纯音频文件，以及画面里始终看不到课件的视频（对着老师的摄像机），会自动退回到纯文本对齐。
+
 ### 设计取舍
 
 - **置信度不依赖 `generate` 的内部返回格式。** Whisper `generate` 的返回结构在不同
@@ -111,8 +139,7 @@ D[i, p] = S[i, p] + max_{q <= p} ( D[i-1, q] - lambda * pen(p - q) )
 ## 快速开始
 
 环境要求：Python 3.12（`requirements.txt` 中锁定的版本在 3.12 上测试），模型权重约占 1.5 GB
-磁盘。`ffmpeg` 为可选：`.wav`/`.flac`/`.mp3` 由 `soundfile` 解码，macOS 上 `.m4a`/`.mp4` 由系统
-自带的 `afconvert` 解码。Linux 上读取视频容器需要安装 `ffmpeg`。
+磁盘。不需要系统安装 `ffmpeg`：视频和压缩音频由 PyAV 解码，它的安装包自带 FFmpeg 库。
 
 ```bash
 git clone https://github.com/KristianLi/LectureSync-ASR.git
@@ -122,7 +149,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-验证安装（自动生成 2 页模拟课件与测试音频并跑通全流程；模型缓存后在 M4 上约 20 秒）：
+验证安装（自动生成 2 页模拟课件与测试音频并跑通全流程；模型缓存后在 M4 上不到一分钟）：
 
 ```bash
 pytest
@@ -179,6 +206,12 @@ python -m src.pipeline --audio lecture.mp4 --pdf slides.pdf --lora checkpoints/w
 | `aligner.jump_penalty` | `0.12` | 上述目标函数中的 `lambda` |
 | `aligner.skip_penalty` | `0.5` | 每跳过一页的额外代价（以 `lambda` 为单位） |
 | `aligner.lexical_weight` | `0.25` | TF-IDF 在相似度中的占比 |
+| `visual.enabled` | `true` | 输入为视频时，在画面中寻找课件 |
+| `visual.min_region_score` | `0.75` | 低于该值则认为视频里没有显示课件 |
+| `visual.weight` | `1.0` | 画面得分加到文本相似度上的权重 |
+| `visual.backward_penalty` | `2.0` | 往回翻页的代价（以 `lambda` 为单位） |
+| `visual.hold_coverage` | `0.6` | 有画面证据的片段超过该比例时，空档沿用最后显示的那一页 |
+| `asr.filter_hallucinations` | `true` | 过滤非语音段上的循环重复和套话幻觉 |
 | `lora.*` | | 秩、alpha、学习率、批大小、梯度累积、精度 |
 
 ## 用 LoRA 微调 Whisper
@@ -230,7 +263,29 @@ python eval/benchmark.py latency --audio path/to/30s_lecture_clip.wav --runs 20
 ### 结果
 
 标记为 `TBD` 或 `TBD-M1` 的单元格是**占位符，不是实测数据**：`TBD-M1` = 待在 M1 MacBook Air
-上实测，`TBD` = 待在运行准确率评测的机器上实测。延迟表中 Mac mini (M4) 的三行是实测值。
+上实测，`TBD` = 待在运行准确率评测的机器上实测。课件对齐表和延迟表中 Mac mini (M4) 的三行是实测值。
+
+**真实课堂上的课件对齐** - 一讲 55 分钟的屏幕录制课堂回放（非公开），47 页课件，转写模型
+`openai/whisper-small`。参考答案是画面上实际显示的课件页，由画面匹配在 271 个清晰显示课件的
+关键帧上得出。以下是实测值。
+
+| 方法 | 页码正确 | 误差不超过 1 页 | 平均误差（页） | 定位到的页数 |
+| --- | ---: | ---: | ---: | ---: |
+| 按时间均匀分配（不看内容） | 14% | 25% | 5.5 | 47 / 47 |
+| 逐句取 `argmax`（不用 DP） | 13% | 23% | 11.0 | 43 / 47 |
+| 单调 DP，仅文本 | 33% | 56% | 5.6 | 20 / 47 |
+| 单调 DP，文本 + 视频画面 | 88% | 90% | 1.6 | 42 / 47 |
+
+如何解读：
+
+- DP 把逐句匹配的准确率提高了一倍多，但仅靠文本最多只到三分之一左右：这份课件有很长一段
+  文字完全相同的页，而且老师多次翻回前面的页，严格单调的路径跟不上。
+- 最后一行**不是独立的准确率**：参考答案和方法都依赖画面匹配，它主要说明融合后的路径确实
+  跟随了画面（剩余的不一致集中在外观相近的页上，低分辨率的参考答案在那里本身就不确定）。
+  独立的验证在测试里：合成一段页码时间线已知的屏幕录制（含文字相同的页和一次往回翻页），
+  要求每个片段都落在真实的页上。
+- 一讲课只是一个数据点。同一门课的另外两段回放是教室摄像机拍摄的，画面通道正确地自动关闭，
+  它们的纯文本对齐无法打分。
 
 **识别准确率** - `openai/whisper-small`，EdAcc `test`，200 条语音
 （`eval/benchmark.py accuracy ... --with-prompt`）
@@ -269,7 +324,7 @@ python eval/benchmark.py latency --audio path/to/30s_lecture_clip.wav --runs 20
 
 ## 测试
 
-`pytest` 会运行 `tests/test_pipeline.py` 中的 14 个测试：
+`pytest` 会运行 `tests/test_pipeline.py` 中的 20 个测试：
 
 - 自动生成的输入：2 页 CS 课件（PyMuPDF）和一段类语音 WAV（NumPy + soundfile）；
 - VAD 规则：0.4 s 的停顿被合并，1.5 s 的停顿被切开，70 s 的连续语音被切成不超过 30 s 的片段；
@@ -277,6 +332,10 @@ python eval/benchmark.py latency --audio path/to/30s_lecture_clip.wav --runs 20
 - 在自动检测到的设备和 CPU 上分别跑通 `VAD -> ASR -> Aligner -> Vocab` 全流程，检查输出
   结构以及模型和张量是否位于预期设备；
 - LoRA 适配器加载（合并权重与保留适配器两种方式）；
+- 画面通道：合成一段带黑边的屏幕录制，页码时间线已知（三页文字完全相同、一次往回翻页、一段
+  没有课件的画面），要求逐帧匹配正确、能修正文本无法解决的对齐、并能从带音轨的视频文件端到端
+  跑通；换成不是视频里那份的课件时必须被拒绝；
+- 幻觉过滤，以及课件文本清理（页脚、网址）；
 - 在 macOS 上，用系统 `say` 命令合成一段包含两个主题的讲解：两页课件都必须被找到，翻页点
   必须落在主题切换处，术语必须带有时间戳并落在正确的页上。
 
@@ -285,7 +344,13 @@ python eval/benchmark.py latency --audio path/to/30s_lecture_clip.wav --runs 20
 
 ## 已知局限
 
-- **单调假设。** 老师翻回前面某一页的情况没有建模，这段讲解会留在当前页。
+- **课件外观相近时，纯文本对齐较弱。** 在上面那讲真实课堂上，它只有约三分之一的时间找对了页。
+  有屏幕录制时请用屏幕录制。
+- **摄像机拍摄的回放得不到画面帮助。** 视频拍的是教室而不是屏幕时，无法识别课件，只能用纯文本
+  对齐。斜着拍到的投影需要特征匹配加单应变换才能识别，目前没有实现。
+- **单调假设（纯文本模式）。** 没有画面证据时，老师翻回前面某一页的情况没有建模，这段讲解会
+  留在当前页。
+- **下课后的讲话。** 老师讲完后学生的交谈仍会被转写（置信度较低），并挂在最后一页上。
 - **过渡句。** 翻页处没有实质内容的句子（“好，下一个话题”）可能落在翻页点的任意一侧。
 - **纯图片页**没有可匹配的文本，除非前后证据迫使路径经过，否则会被跳过。
 - **时间戳。** 短语边界来自 Whisper 的时间戳 token（20 ms 分辨率）。超过 12 s 的短语按句末
@@ -297,7 +362,8 @@ python eval/benchmark.py latency --audio path/to/30s_lecture_clip.wav --runs 20
 
 - *首次运行很慢，或离线时失败。* 模型在首次使用时下载：Whisper small（约 1 GB）、MiniLM
   （约 90 MB）、Silero VAD（约 2 MB）。
-- *Linux 上无法解码 `.m4a`/`.mp4`。* 请安装 `ffmpeg`。
+- *画面通道没有启用。* 日志里出现 `Video does not show the slides` 表示画面中没有任何区域与课件
+  吻合：请确认 PDF 是这一讲用的课件，并且回放是屏幕流而不是教室摄像机。
 - *macOS 上 `torch.hub` 报证书错误。* VAD 加载器会自动让 OpenSSL 使用 `certifi` 的证书；
   如果 hub 仍不可达，会回退到 `silero-vad` 安装包，再回退到能量检测，并在日志中写明所用后端。
 - *某个算子在 MPS 上未实现。* `src/utils.py` 在导入 PyTorch 之前设置了
@@ -314,7 +380,8 @@ LectureSync-ASR/
 │   ├── utils.py        # 设备管理、音频加载、配置、日志
 │   ├── vad.py          # Silero VAD 封装
 │   ├── asr.py          # Whisper + LoRA + 术语提示
-│   ├── aligner.py      # PDF 提取、向量编码、单调 DP
+│   ├── aligner.py      # PDF 提取、向量编码、单调 DP、画面融合
+│   ├── visual.py       # 视频关键帧与课件渲染图比对
 │   ├── vocab.py        # 术语提取
 │   ├── pipeline.py     # 流程编排、Markdown 导出、命令行
 │   └── train_lora.py   # LoRA 微调

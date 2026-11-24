@@ -40,6 +40,7 @@ from src.asr import WhisperASR  # noqa: E402
 from src.pipeline import LecturePipeline, LectureResult, export_markdown  # noqa: E402
 from src.utils import SAMPLE_RATE, DeviceManager, format_timestamp, load_audio, load_config, normalize_text  # noqa: E402
 from src.vad import SpeechSegment, VoiceActivityDetector  # noqa: E402
+from src.visual import has_video_stream, match_video_to_slides  # noqa: E402
 from src.vocab import TermExtractor, clean_slide_texts, highlight_terms, term_recall  # noqa: E402
 
 TEST_MODEL = os.environ.get("LECTURESYNC_TEST_MODEL", "openai/whisper-tiny")
@@ -141,6 +142,112 @@ def synthesize_speech(path: Path) -> Path:
     return path
 
 
+# A deck whose middle pages share every word and differ only in a drawing: the case text
+# alignment cannot solve. ``None`` in the timeline is a stretch where the video shows
+# something else (camera, demo), and page 1 is revisited to exercise backward moves.
+ANIMATION_TIMELINE = [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4), (1, 4), (None, 4), (5, 4)]
+VIDEO_FPS = 2
+VIDEO_SIZE = (640, 360)
+SLIDE_RECT = (106, 20, 427, 320)  # x, y, w, h of the 4:3 slide inside the 16:9 frame
+
+
+def make_animation_deck(path: Path) -> Path:
+    """Six 4:3 pages; pages 2-4 have identical text and a shape in a different place."""
+    import pymupdf
+
+    document = pymupdf.open()
+    layouts = [
+        ("Linear filtering", ["A kernel slides over the image", "Each output pixel is a weighted sum"], None),
+        ("Border handling", ["Pad with zeros", "Replicate the edge pixels"], (80, 330, 300, 480)),
+        ("Worked example", ["Apply the kernel step by step"], (60, 220, 200, 360)),
+        ("Worked example", ["Apply the kernel step by step"], (290, 220, 430, 360)),
+        ("Worked example", ["Apply the kernel step by step"], (520, 220, 660, 360)),
+        ("Summary", ["Filters are small kernels", "Borders need care"], (420, 380, 680, 500)),
+    ]
+    for index, (title, bullets, box) in enumerate(layouts):
+        page = document.new_page(width=720, height=540)
+        page.insert_text((50, 80), title, fontsize=36)
+        for row, bullet in enumerate(bullets):
+            page.insert_text((70, 140 + 44 * row), f"- {bullet}", fontsize=22)
+        if box is not None:
+            page.draw_rect(pymupdf.Rect(*box), color=(0, 0, 0), fill=(0.15 + 0.12 * index, 0.3, 0.75 - 0.1 * index), width=2)
+            page.draw_circle(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), 28, color=(1, 1, 1), fill=(1, 1, 1))
+    document.save(str(path))
+    document.close()
+    return path
+
+
+def make_slide_video(path: Path, pdf_path: Path, with_audio: bool = False) -> Path:
+    """Encode ``ANIMATION_TIMELINE`` as a pillar-boxed screen recording (MPEG-4, key frame every second)."""
+    import av
+    import pymupdf
+    from PIL import Image
+
+    x, y, w, h = SLIDE_RECT
+    rng = np.random.default_rng(0)
+    with pymupdf.open(str(pdf_path)) as document:
+        renders = []
+        for page in document:
+            pixmap = page.get_pixmap(dpi=72, alpha=False)
+            image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples).resize((w, h), Image.BILINEAR)
+            renders.append(np.asarray(image))
+
+    with av.open(str(path), mode="w") as container:
+        video = container.add_stream("mpeg4", rate=VIDEO_FPS)
+        video.width, video.height = VIDEO_SIZE
+        video.pix_fmt = "yuv420p"
+        video.bit_rate = 2_000_000
+        video.gop_size = VIDEO_FPS
+        audio = None
+        if with_audio:
+            audio = container.add_stream("aac", rate=SAMPLE_RATE)
+            audio.layout = "mono"
+
+        frame_index = 0
+        for page, seconds in ANIMATION_TIMELINE:
+            for _ in range(seconds * VIDEO_FPS):
+                canvas = np.zeros((VIDEO_SIZE[1], VIDEO_SIZE[0], 3), dtype=np.uint8)
+                if page is None:  # "camera": smooth blobs unrelated to any slide
+                    blobs = rng.integers(0, 255, (9, 16, 3), dtype=np.uint8)
+                    canvas = np.asarray(Image.fromarray(blobs).resize(VIDEO_SIZE, Image.BICUBIC)).copy()
+                else:
+                    canvas[y : y + h, x : x + w] = renders[page]
+                frame = av.VideoFrame.from_ndarray(canvas, format="rgb24")
+                frame.pts = frame_index
+                frame_index += 1
+                for packet in video.encode(frame):
+                    container.mux(packet)
+        for packet in video.encode(None):
+            container.mux(packet)
+
+        if audio is not None:
+            total = sum(seconds for _, seconds in ANIMATION_TIMELINE)
+            wave = np.concatenate([speech_like(3.0, 110.0 + 5 * k, k) if k % 2 == 0 else silence(1.0, k) for k in range(total // 2)])
+            wave = np.pad(wave, (0, max(0, total * SAMPLE_RATE - len(wave))))[: total * SAMPLE_RATE]
+            for offset in range(0, len(wave), 1024):
+                chunk = wave[offset : offset + 1024]
+                if len(chunk) < 1024:
+                    chunk = np.pad(chunk, (0, 1024 - len(chunk)))
+                audio_frame = av.AudioFrame.from_ndarray(chunk[None, :].astype(np.float32), format="fltp", layout="mono")
+                audio_frame.sample_rate = SAMPLE_RATE
+                audio_frame.pts = offset
+                for packet in audio.encode(audio_frame):
+                    container.mux(packet)
+            for packet in audio.encode(None):
+                container.mux(packet)
+    return path
+
+
+def timeline_page(time_sec: float):
+    """Ground-truth page shown at ``time_sec`` (``None`` during the camera stretch)."""
+    cursor = 0.0
+    for page, seconds in ANIMATION_TIMELINE:
+        if cursor <= time_sec < cursor + seconds:
+            return page
+        cursor += seconds
+    return ANIMATION_TIMELINE[-1][0]
+
+
 def model_or_skip(action, what: str):
     """Run ``action`` and skip the test if model weights cannot be obtained (offline, no cache)."""
     try:
@@ -174,6 +281,16 @@ def slides_pdf(workdir: Path) -> Path:
 @pytest.fixture(scope="session")
 def synthetic_wav(workdir: Path) -> Path:
     return make_synthetic_wav(workdir / "synthetic.wav")
+
+
+@pytest.fixture(scope="session")
+def animation_deck(workdir: Path) -> Path:
+    return make_animation_deck(workdir / "animation_deck.pdf")
+
+
+@pytest.fixture(scope="session")
+def slide_video(workdir: Path, animation_deck: Path) -> Path:
+    return make_slide_video(workdir / "screen_recording.mp4", animation_deck)
 
 
 @pytest.fixture(scope="session")
@@ -368,6 +485,52 @@ def test_slide_text_cleaning_and_glossary_ranking(config: Dict[str, Any]) -> Non
     assert not any("example" in term or "http" in term for term in lowered)
 
 
+def test_visual_matching_identifies_the_slide_on_screen(
+    config: Dict[str, Any], animation_deck: Path, slide_video: Path, synthetic_wav: Path
+) -> None:
+    """Frames of a synthetic screen recording are matched to the right page, look-alikes included."""
+    assert has_video_stream(slide_video) and not has_video_stream(synthetic_wav)
+    assert match_video_to_slides(synthetic_wav, animation_deck, config["visual"]) is None  # audio only
+
+    evidence = match_video_to_slides(slide_video, animation_deck, config["visual"])
+    assert evidence is not None and evidence.similarity.shape[1] == 6
+    x, y, w, h = evidence.region
+    assert abs(x - SLIDE_RECT[0]) <= 8 and abs(y - SLIDE_RECT[1]) <= 8 and abs(h - SLIDE_RECT[3]) <= 12
+    assert evidence.region_score > 0.9
+
+    checked = 0
+    for time_sec, page, best in zip(evidence.times, evidence.pages, evidence.best):
+        truth = timeline_page(float(time_sec))
+        boundary = min(abs(float(time_sec) % 4.0), 4.0 - float(time_sec) % 4.0) < 0.6  # a page turn is in progress
+        if truth is None:
+            assert boundary or best < 0.6, f"camera frame at {time_sec:.1f}s matched slide {page} with {best:.2f}"
+        elif not boundary:
+            assert page == truth and best > 0.9, f"{time_sec:.1f}s: got {page} ({best:.2f}), expected {truth}"
+            checked += 1
+    assert checked >= 20
+    assert 0.7 < evidence.coverage() < 0.95  # everything except the 4 s camera stretch
+
+    # Per-segment scores: decisive where a slide is shown, silent during the camera stretch.
+    scores = evidence.segment_scores([8.5, 25.0], [10.5, 27.0])
+    assert scores[0].argmax() == 2 and scores[0].max() > 0.9 and scores[1].max() == 0.0
+
+    # A deck that is not the one in the video must be rejected rather than force-matched.
+    other = make_slides_pdf(animation_deck.with_name("other_deck.pdf"))
+    assert match_video_to_slides(slide_video, other, config["visual"]) is None
+
+
+def test_dp_backward_moves_are_opt_in() -> None:
+    similarity = np.array([[0.9, 0.1, 0.1], [0.1, 0.1, 0.9], [0.9, 0.1, 0.1], [0.9, 0.1, 0.1], [0.1, 0.9, 0.1]])
+    strict = monotonic_dp_align(similarity, 0.1, 0.5)
+    assert all(a <= b for a, b in zip(strict, strict[1:]))
+    assert monotonic_dp_align(similarity, 0.1, 0.5, backward_penalty=2.0) == [0, 2, 0, 0, 1]
+    # Relaxed transitions only into flagged segments: the move back at index 2 is not allowed.
+    gated = monotonic_dp_align(similarity, 0.1, 0.5, backward_penalty=2.0, relaxed_steps=[True, True, False, False, True])
+    assert gated[2] >= gated[1] and gated[3] >= gated[2]
+    with pytest.raises(ValueError):
+        monotonic_dp_align(similarity, 0.1, 0.5, backward_penalty=2.0, relaxed_steps=[True])
+
+
 def test_hallucination_filter() -> None:
     """Decoder loops and low-confidence stock phrases are removed; real speech is untouched."""
     asr = WhisperASR({"filter_hallucinations": True}, DeviceManager("cpu"))  # no model needed for the filter
@@ -459,6 +622,7 @@ def test_end_to_end_on_synthetic_audio(
     assert all(page.image_path is not None and page.image_path.is_file() for page in result.deck.pages)
     assert result.glossary[0] == "ResNet" and "gradient descent" in result.glossary
     assert "gradient descent" in result.meta["prompt"]
+    assert result.meta["visual"] == {"used": False, "segment_coverage": 0.0} and result.meta["alignment_mode"] == "text"
 
     assert_transcript_schema(result.segments, result.duration)
     pages = [seg["page"] for seg in result.segments]
@@ -504,6 +668,56 @@ def test_alignment_and_vocab_on_scripted_transcript(pipeline: LecturePipeline, s
     assert entries["RANSAC"].occurrences[0].page == 1 and 35.0 <= entries["RANSAC"].first_time <= 39.5
     assert entries["learning rate"].count == 2 and entries["learning rate"].occurrences[0].page == 0
     assert [occ.page for occ in entries["homography"].occurrences] == [0, 1]  # mentioned early, explained later
+
+
+def test_visual_evidence_resolves_look_alike_slides(
+    pipeline: LecturePipeline, config: Dict[str, Any], animation_deck: Path, slide_video: Path
+) -> None:
+    """With identical narration on every slide, only the picture can place the segments."""
+    deck = SlideDeck.from_pdf(animation_deck)
+    segments = [
+        {"id": i, "start": 2.0 * i + 0.3, "end": 2.0 * i + 1.7, "text": "And now we apply the kernel to the next position.", "confidence": 0.9}
+        for i in range(16)
+    ]
+    truth = [timeline_page(seg["start"] + 0.7) for seg in segments]
+
+    text_only = pipeline.aligner.align(segments, deck)
+    assert text_only.mode == "text" and text_only.assignments == sorted(text_only.assignments)
+    wrong = sum(1 for got, want in zip(text_only.assignments, truth) if want is not None and got != want)
+    assert wrong >= 6  # text cannot separate pages that say the same thing
+
+    evidence = match_video_to_slides(slide_video, animation_deck, config["visual"])
+    fused = pipeline.aligner.align(segments, deck, evidence)
+    assert fused.mode == "text+visual" and fused.visual_coverage > 0.8
+    for got, want in zip(fused.assignments, truth):
+        if want is not None:
+            assert got == want
+    camera = [got for got, want in zip(fused.assignments, truth) if want is None]
+    assert camera == [1] * len(camera)  # nothing on screen: speech stays with the slide shown last
+    assert len(fused.page_visits[1]) == 2 and fused.page_ranges[1][0] < 6.0  # page 1 was revisited
+    assert fused.page_ranges[5] is not None and fused.page_ranges[5][0] > 27.0
+
+
+def test_end_to_end_on_video_input(
+    pipeline: LecturePipeline, config: Dict[str, Any], animation_deck: Path, workdir: Path
+) -> None:
+    """A video file goes through audio decoding, visual matching and fused alignment."""
+    video = make_slide_video(workdir / "screen_recording_with_audio.mp4", animation_deck, with_audio=True)
+    audio = load_audio(video)
+    assert abs(len(audio) / SAMPLE_RATE - 32.0) < 0.5
+
+    pipeline.vad = VoiceActivityDetector(dict(config["vad"], backend="energy"))
+    result = pipeline.run(video, animation_deck, work_dir=workdir / "e2e_video")
+    assert result.meta["visual"]["used"] is True and result.meta["alignment_mode"] == "text+visual"
+    assert result.meta["visual"]["slide_visible_fraction"] > 0.7
+    assert "visual_sec" in result.timings and len(result.page_visits) == 6
+    assert_transcript_schema(result.segments, result.duration)
+    for seg in result.segments:
+        want = timeline_page(0.5 * (seg["start"] + seg["end"]))
+        if want is not None and seg["end"] - seg["start"] < 3.0:
+            assert abs(seg["page"] - want) <= 1 or seg["page"] == timeline_page(seg["start"])
+    notes = export_markdown(result)
+    assert "alignment: text+visual" in notes
 
 
 def test_lora_adapter_loading(config: Dict[str, Any], device_manager: DeviceManager, workdir: Path) -> None:
