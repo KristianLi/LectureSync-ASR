@@ -163,7 +163,9 @@ def monotonic_dp_align(
 
     page_ids = np.arange(n_pages)
     # transition[q, p] = lambda * pen(p - q); +inf where p < q forbids going backwards.
-    transition = jump_lambda * jump_penalty(page_ids[None, :] - page_ids[:, None], skip_penalty)
+    # The forbidden entries are set explicitly: lambda * inf would be NaN for lambda == 0.
+    delta = page_ids[None, :] - page_ids[:, None]
+    transition = np.where(delta < 0, np.inf, jump_lambda * jump_penalty(np.maximum(delta, 0), skip_penalty))
 
     best = np.empty((n_segments, n_pages), dtype=np.float64)
     backpointer = np.zeros((n_segments, n_pages), dtype=np.int64)
