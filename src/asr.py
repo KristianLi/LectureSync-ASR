@@ -90,6 +90,10 @@ class WhisperASR:
         self.prompt_max_terms: int = int(cfg.get("prompt_max_terms", 40))
         self.prompt_max_tokens: int = int(cfg.get("prompt_max_tokens", 120))
 
+        # Extra keyword arguments forwarded to ``generate``; the latency benchmark uses this
+        # to pin the decode length (``min_new_tokens == max_new_tokens``).
+        self.generation_overrides: Dict[str, Any] = {}
+
         self.device_manager: DeviceManager = device_manager or DeviceManager()
         self.processor: Any = None
         self.model: Any = None
@@ -253,6 +257,7 @@ class WhisperASR:
             kwargs["task"] = self.task
         if self._prompt_ids is not None:
             kwargs["prompt_ids"] = self._prompt_ids
+        kwargs.update(self.generation_overrides)
         return kwargs
 
     def _content_tokens(self, row: Sequence[int]) -> List[int]:
