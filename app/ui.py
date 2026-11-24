@@ -354,7 +354,9 @@ mark.ls-term { background: color-mix(in srgb, var(--color-accent) 22%, transpare
 .ls-chip:hover { border-color: var(--color-accent); }
 .ls-card-ctx { font-size: .88rem; line-height: 1.45; margin-top: 6px; }
 .ls-muted { color: var(--body-text-color-subdued); font-size: .8rem; }
-.ls-speed-active, .ls-speed-btn button.ls-speed-active { outline: 2px solid var(--color-accent); outline-offset: -2px; font-weight: 700; }
+.ls-speed-btn, .ls-speed-btn button { transition: none !important; }
+.ls-speed-btn.ls-speed-active, .ls-speed-btn button.ls-speed-active { background: var(--color-accent) !important;
+  border-color: var(--color-accent) !important; color: #fff !important; }
 """
 
 

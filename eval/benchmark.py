@@ -361,7 +361,8 @@ def run_latency(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, A
     )
     for key, value in result["accelerator_memory"].items():
         print(f"\n{key}: {value:.0f} MB", end="")
-    stem = f"latency_{asr.model_name.split('/')[-1]}_{info['device']}_{info['dtype']}"
+    kind = "real" if args.audio else "synthetic"
+    stem = f"latency_{asr.model_name.split('/')[-1]}_{info['device']}_{info['dtype']}_{kind}"
     path = save_results(result, Path(bench_cfg["results_dir"]), stem)
     print(f"\n\nSaved: {path}")
     return result
