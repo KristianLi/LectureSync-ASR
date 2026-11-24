@@ -144,6 +144,8 @@ something sometimes sort start step steps still stuff sure take takes talk tell 
 third three time times today together took try two use used uses using usually want way ways week well went
 whole work works yeah year years lecture lectures course class chapter section page outline overview summary
 agenda introduction conclusion reference references figure table university professor dr department
+explain explains identify describe implement understand perform discuss compare evaluate analyse analyze apply
+detect provided provide including include install access vary due asst
 """.split()
 )
 
@@ -156,7 +158,8 @@ values various version works based called common given known large small using w
 """.split()
 )
 
-_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[-'][A-Za-z0-9]+)*")
+_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9]*(?:[-'][A-Za-z0-9]+)*")
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+|\S+@\S+\.\S+", re.IGNORECASE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _PHRASE_BREAK_RE = re.compile(r"[^\w\s\-']|[\n\r\t]|\s[-–—•]\s|_")
 
@@ -271,18 +274,50 @@ def split_sentences(text: str) -> List[str]:
     return [s.strip() for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
 
 
+def clean_slide_texts(page_texts: Sequence[str]) -> List[str]:
+    """Remove text that says nothing about a slide's topic.
+
+    * URLs and e-mail addresses (otherwise ``http`` and domain fragments become "terms"),
+    * boilerplate lines repeated on more than half of the pages: footers, course codes,
+      lecturer names, page headers. Only applied to decks of four or more pages.
+    """
+    pages = [[_URL_RE.sub(" ", line).strip() for line in text.splitlines()] for text in page_texts]
+    if len(pages) >= 4:
+        line_pages: Counter = Counter()
+        for lines in pages:
+            line_pages.update({line.lower() for line in lines if line})
+        boilerplate = {line for line, count in line_pages.items() if count > len(pages) / 2}
+        pages = [[line for line in lines if line.lower() not in boilerplate] for lines in pages]
+    return ["\n".join(line for line in lines if line) for lines in pages]
+
+
+def _phrase_token_ok(token: str) -> bool:
+    """Whether a token may be part of a mined phrase.
+
+    Rejects numbers, one- and two-character fragments (``x1``, ``nd``, ``KB``) and short
+    alphanumeric labels, while keeping ``2D``/``3D`` and names such as ``word2vec``.
+    """
+    if token.isdigit() or token.lower() in _STOPWORDS:
+        return False
+    if re.fullmatch(r"\d[dD]", token):
+        return True
+    if any(ch.isdigit() for ch in token):
+        return len(token) >= 4 and sum(ch.isalpha() for ch in token) >= 2 and not token[0].isdigit()
+    return len(token) >= 3
+
+
 def candidate_phrases(text: str, max_words: int = 4) -> List[str]:
     """RAKE-style noun-phrase candidates: maximal runs of content words.
 
-    The text is cut at punctuation, line breaks and stop words; every remaining run of
-    one to ``max_words`` tokens is a candidate, returned with its original casing.
+    The text is cut at punctuation, line breaks, stop words and tokens rejected by
+    :func:`_phrase_token_ok`; every remaining run of one to ``max_words`` tokens is a
+    candidate, returned with its original casing.
     """
     phrases: List[str] = []
     for chunk in _PHRASE_BREAK_RE.split(text):
         run: List[str] = []
         for token in _TOKEN_RE.findall(chunk) + [""]:
-            lowered = token.lower()
-            if token and lowered not in _STOPWORDS and not token.isdigit() and len(token) > 1:
+            if token and _phrase_token_ok(token):
                 run.append(token)
                 continue
             if 0 < len(run) <= max_words:
@@ -295,7 +330,7 @@ def _looks_technical(word: str) -> bool:
     """True for single words that are almost certainly names of things: acronyms
     (``RANSAC``), CamelCase (``ResNet``), words with digits (``word2vec``) or hyphens."""
     return (
-        (word.isupper() and len(word) >= 2)
+        (word.isupper() and len(word) >= 3)
         or any(ch.isdigit() for ch in word)
         or any(ch.isupper() for ch in word[1:])
         or "-" in word
@@ -439,6 +474,10 @@ class TermExtractor:
         return hits
 
     def _slide_keyphrases(self, page_texts: Sequence[str]) -> Dict[str, float]:
+        """TF-IDF score per mined slide phrase; see :meth:`_slide_phrase_stats`."""
+        return {name: score for name, (score, _) in self._slide_phrase_stats(page_texts).items()}
+
+    def _slide_phrase_stats(self, page_texts: Sequence[str]) -> Dict[str, Tuple[float, int]]:
         """TF-IDF-scored noun-phrase candidates from the slides (documents = pages).
 
         Multi-word runs are kept as they are. A single word is only kept when it looks
@@ -447,7 +486,7 @@ class TermExtractor:
         already covered by the lexicon.
 
         Returns:
-            Mapping from the phrase (most frequent surface form) to its score.
+            Mapping from the phrase (most frequent surface form) to ``(score, total count)``.
         """
         per_page: List[Counter] = []
         surface: Dict[str, Counter] = defaultdict(Counter)
@@ -464,6 +503,7 @@ class TermExtractor:
             doc_freq.update(counts.keys())
 
         scores: Dict[str, float] = defaultdict(float)
+        totals: Dict[str, int] = defaultdict(int)
         for counts in per_page:
             for key, tf in counts.items():
                 words = key.split()
@@ -478,7 +518,8 @@ class TermExtractor:
                 length_boost = 1.0 + 0.35 * (len(words) - 1)
                 name = best_surface if len(words) == 1 else key
                 scores[name] += (1.0 + math.log(tf)) * idf * length_boost
-        return dict(scores)
+                totals[name] += tf
+        return {name: (score, totals[name]) for name, score in scores.items()}
 
     def _canonical(self, phrase: str) -> str:
         """Map a lower-cased phrase to the lexicon's spelling when it is a known term."""
@@ -490,17 +531,20 @@ class TermExtractor:
         """Pick the slide terms that should be injected into the Whisper prompt.
 
         Order: user glossary, then lexicon terms found on the slides (most frequent
-        first), then the highest-scoring slide key phrases.
+        first), then mined slide phrases. Mined phrases are ranked by how often the deck
+        uses them, then by TF-IDF: a phrase the lecturer put on five slides is far more
+        likely to be said aloud than a name that appears once on the title page.
         """
         limit = int(max_terms or self.max_glossary_terms)
+        page_texts = clean_slide_texts(page_texts)
         joined = "\n".join(page_texts)
         lexicon_hits = self._lexicon_hits(joined)
         ranked_lexicon = sorted(
             (t for t in lexicon_hits if self._lexicon[t] == CATEGORY_CS_AI),
             key=lambda t: (-lexicon_hits[t], -len(t)),
         )
-        keyphrases = self._slide_keyphrases(page_texts)
-        ranked_phrases = sorted(keyphrases, key=lambda p: -keyphrases[p])
+        stats = self._slide_phrase_stats(page_texts)
+        ranked_phrases = sorted(stats, key=lambda p: (-stats[p][1], -stats[p][0]))
 
         glossary: List[str] = []
         seen: Set[str] = set()
@@ -544,6 +588,7 @@ class TermExtractor:
             the sentence of every occurrence.
         """
         limit = int(top_k or self.top_k)
+        page_texts = clean_slide_texts(page_texts)
         transcript = " ".join(str(seg.get("text", "")) for seg in segments)
         slide_text = "\n".join(page_texts)
 
@@ -575,8 +620,8 @@ class TermExtractor:
                 continue
             if not occurrences and (not self.include_slide_only or category == CATEGORY_ACADEMIC):
                 continue
-            if category == CATEGORY_SLIDE and not occurrences and tfidf < 0.5:
-                continue
+            if category == CATEGORY_SLIDE and not occurrences:
+                continue  # a mined phrase only becomes vocabulary once the lecturer actually says it
             count = len(spoken.get(term, []))
             score = _CATEGORY_WEIGHT[category] + tfidf
             score += 0.5 if (occurrences and slide_pages) else 0.0

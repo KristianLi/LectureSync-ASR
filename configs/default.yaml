@@ -33,6 +33,7 @@ asr:
   sub_segment_timestamps: true   # split each VAD chunk into phrase-level segments via Whisper timestamp tokens
   max_subsegment_sec: 12.0       # phrases longer than this are cut at sentence ends (times interpolated)
   min_confidence: 0.0     # drop segments whose mean token probability is below this (0 disables)
+  filter_hallucinations: true   # drop decoder loops and stock phrases ("Thank you.") invented on non-speech
   prompt_prefix: "This is a university computer science lecture. Key terms:"
   prompt_max_terms: 40
   prompt_max_tokens: 120  # Whisper keeps at most 223 prompt tokens; stay well below

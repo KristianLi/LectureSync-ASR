@@ -34,6 +34,20 @@ logger = get_logger(__name__)
 
 _TIMESTAMP_STEP_SEC = 0.02  # Whisper timestamp tokens advance in 20 ms increments
 _WHITESPACE_RE = re.compile(r"\s+")
+_NON_WORD_RE = re.compile(r"[^a-z0-9' ]+")
+
+# Phrases Whisper is known to invent on silence, music, applause or distant chatter
+# (they dominate the subtitles it was trained on). Compared after lower-casing and
+# stripping punctuation.
+_HALLUCINATED_PHRASES = frozenset(
+    {
+        "thank you", "thank you very much", "thank you so much", "thanks", "thanks for watching",
+        "thank you for watching", "thanks for listening", "please subscribe", "you", "bye", "bye bye",
+        "the end", "subtitles by the amara org community",
+    }
+)  # fmt: skip
+_HALLUCINATION_MAX_CONFIDENCE = 0.6
+_LOOP_MIN_REPEATS = 3
 
 
 class TranscriptSegment(TypedDict):
@@ -86,6 +100,7 @@ class WhisperASR:
         self.sub_segment_timestamps: bool = bool(cfg.get("sub_segment_timestamps", True))
         self.max_subsegment_sec: float = float(cfg.get("max_subsegment_sec", 12.0))
         self.min_confidence: float = float(cfg.get("min_confidence", 0.0))
+        self.filter_hallucinations: bool = bool(cfg.get("filter_hallucinations", True))
         self.prompt_prefix: str = str(cfg.get("prompt_prefix", "Key terms:"))
         self.prompt_max_terms: int = int(cfg.get("prompt_max_terms", 40))
         self.prompt_max_tokens: int = int(cfg.get("prompt_max_tokens", 120))
@@ -379,6 +394,45 @@ class WhisperASR:
         pieces.append((piece_start, end, tokens[first:], log_probs[first:]))
         return pieces
 
+    def _drop_hallucinations(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove decoder loops and stock phrases invented on non-speech audio.
+
+        Real recordings contain stretches the VAD lets through but nobody is lecturing in:
+        applause, a video being played, students chatting after the lecture has ended. On
+        those Whisper tends to (a) repeat one phrase over and over and (b) emit subtitle
+        boilerplate such as "Thank you." Three rules, applied to the phrases of one chunk:
+
+        1. a phrase repeated three or more times in a row is a loop; one copy is kept,
+        2. a stock phrase is dropped when it came out of a loop or has low confidence,
+        3. if nothing but stock phrases is left, the whole chunk is dropped.
+
+        A clearly spoken "thank you" inside a chunk that has other content is kept.
+        """
+        if not self.filter_hallucinations or not items:
+            return items
+
+        def key(item: Mapping[str, Any]) -> str:
+            return _WHITESPACE_RE.sub(" ", _NON_WORD_RE.sub(" ", str(item["text"]).lower())).strip()
+
+        runs: List[List[Dict[str, Any]]] = []
+        for item in items:
+            if runs and key(runs[-1][0]) == key(item):
+                runs[-1].append(item)
+            else:
+                runs.append([item])
+
+        kept: List[Dict[str, Any]] = []
+        for run in runs:
+            phrase = key(run[0])
+            looped = len(run) >= _LOOP_MIN_REPEATS
+            stock = phrase in _HALLUCINATED_PHRASES or not phrase
+            if stock and (looped or float(run[0]["confidence"]) < _HALLUCINATION_MAX_CONFIDENCE):
+                continue
+            kept.extend(run[:1] if looped else run)
+        if kept and all(key(item) in _HALLUCINATED_PHRASES for item in kept):
+            return []
+        return kept
+
     @staticmethod
     def _confidence(log_probs: Sequence[float]) -> float:
         """Geometric-mean token probability, clipped to ``[0, 1]``."""
@@ -438,7 +492,7 @@ class WhisperASR:
                         "confidence": round(confidence, 4),
                     }
                 )
-            results.append(items)
+            results.append(self._drop_hallucinations(items))
         return results
 
     def _decode_batch_safe(self, segments: Sequence[SpeechSegment]) -> List[List[Dict[str, Any]]]:

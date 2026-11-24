@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 from .utils import DeviceManager, PathLike, get_logger
+from .vocab import clean_slide_texts
 
 logger = get_logger(__name__)
 
@@ -334,7 +335,8 @@ class SlideAligner:
             :class:`AlignmentResult`; ``assignments[i]`` is the page of ``segments[i]``.
         """
         texts = [str(seg.get("text", "")) for seg in segments]
-        similarity = self.similarity_matrix(texts, deck.texts)
+        # Footers, course codes and URLs repeat on every page and only add noise to the match.
+        similarity = self.similarity_matrix(texts, clean_slide_texts(deck.texts))
         assignments = monotonic_dp_align(similarity, self.jump_lambda, self.skip_penalty)
 
         page_ranges: List[Optional[tuple]] = [None] * len(deck)

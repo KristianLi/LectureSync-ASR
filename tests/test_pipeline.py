@@ -40,7 +40,7 @@ from src.asr import WhisperASR  # noqa: E402
 from src.pipeline import LecturePipeline, LectureResult, export_markdown  # noqa: E402
 from src.utils import SAMPLE_RATE, DeviceManager, format_timestamp, load_audio, load_config, normalize_text  # noqa: E402
 from src.vad import SpeechSegment, VoiceActivityDetector  # noqa: E402
-from src.vocab import TermExtractor, highlight_terms, term_recall  # noqa: E402
+from src.vocab import TermExtractor, clean_slide_texts, highlight_terms, term_recall  # noqa: E402
 
 TEST_MODEL = os.environ.get("LECTURESYNC_TEST_MODEL", "openai/whisper-tiny")
 
@@ -343,6 +343,56 @@ def test_vocab_extraction_highlighting_and_recall(config: Dict[str, Any]) -> Non
     assert recall["matched"] == 1 and recall["total"] == 2 and recall["recall"] == 0.5
     assert normalize_text("Back-Propagation, it's GREAT!") == "back propagation it's great"
     assert format_timestamp(3725) == "1:02:05" and format_timestamp(65.4) == "01:05"
+
+
+def test_slide_text_cleaning_and_glossary_ranking(config: Dict[str, Any]) -> None:
+    """Footers, URLs and label fragments must not reach the Whisper prompt."""
+    footer = "CS101 Machine Perception | Dr Ada Example"
+    pages = [
+        f"Linear filtering\nA kernel slides over the image\nSee https://example.org/filters?id=3\n{footer}",
+        f"Linear filtering\nBorder handling: x1 x0 pad with 0\nExplain border handling choices\n{footer}",
+        f"Separable filters\nBorder handling again\nMail ada@example.org for help, 12 KB\n{footer}",
+        f"Summary\nSeparable filters are cheap\n{footer}",
+        f"Questions\n{footer}",
+    ]
+    cleaned = clean_slide_texts(pages)
+    assert all(footer not in page for page in cleaned)  # repeated on every page -> boilerplate
+    assert "example.org" not in " ".join(cleaned) and "Linear filtering" in cleaned[0]
+    assert clean_slide_texts(pages[:2])[0].endswith(footer)  # too few pages to call anything boilerplate
+
+    glossary = TermExtractor(config["vocab"]).extract_glossary(pages)
+    lowered = [term.lower() for term in glossary]
+    assert "kernel" in lowered and "border handling" in lowered and "separable filters" in lowered
+    for junk in ("http", "x1", "x0", "kb", "ada example", "cs101 machine perception", "explain border handling choices"):
+        assert junk not in lowered, (junk, glossary)
+    assert not any("example" in term or "http" in term for term in lowered)
+
+
+def test_hallucination_filter() -> None:
+    """Decoder loops and low-confidence stock phrases are removed; real speech is untouched."""
+    asr = WhisperASR({"filter_hallucinations": True}, DeviceManager("cpu"))  # no model needed for the filter
+
+    def item(text: str, confidence: float = 0.9, start: float = 0.0) -> Dict[str, Any]:
+        return {"start": start, "end": start + 1.0, "text": text, "confidence": confidence}
+
+    assert asr._drop_hallucinations([item("Thank you.", 0.95)]) == []  # a chunk that is only a stock phrase
+    assert asr._drop_hallucinations([item("Thank you.", 0.9, i) for i in range(20)]) == []  # looped stock phrase
+    assert asr._drop_hallucinations([item("...", 0.3)]) == []
+
+    mixed = [item("So the kernel is flipped."), item("Thank you.", 0.4, 1.0), item("Any questions?", 0.8, 2.0)]
+    assert [x["text"] for x in asr._drop_hallucinations(mixed)] == ["So the kernel is flipped.", "Any questions?"]
+
+    polite = [item("That is all for today."), item("Thank you.", 0.93, 1.0)]
+    assert asr._drop_hallucinations(polite) == polite  # clearly spoken, next to real content -> kept
+
+    loop = [item("and then we add the bias,", 0.8, i) for i in range(7)] + [item("which gives the output.", 0.9, 7.0)]
+    assert [x["text"] for x in asr._drop_hallucinations(loop)] == ["and then we add the bias,", "which gives the output."]
+
+    twice = [item("No.", 0.9), item("No.", 0.9, 1.0), item("That is wrong.", 0.9, 2.0)]
+    assert asr._drop_hallucinations(twice) == twice  # two repeats are normal speech
+
+    asr.filter_hallucinations = False
+    assert asr._drop_hallucinations([item("Thank you.", 0.2)]) != []
 
 
 # --------------------------------------------------------------------------- model-backed tests
