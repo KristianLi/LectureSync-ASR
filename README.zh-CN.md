@@ -229,9 +229,8 @@ python eval/benchmark.py latency --audio path/to/30s_lecture_clip.wav --runs 20
 
 ### 结果
 
-下面的表格是**模板**：其中没有任何数字是已经实测的。每个单元格都是占位符，需要在对应机器上
-实测后填入：`TBD-M1` = 待在 M1 MacBook Air 上实测，`TBD-M4` = 待在 M4 Mac mini 上实测，
-`TBD` = 待在运行准确率评测的机器上实测。
+标记为 `TBD` 或 `TBD-M1` 的单元格是**占位符，不是实测数据**：`TBD-M1` = 待在 M1 MacBook Air
+上实测，`TBD` = 待在运行准确率评测的机器上实测。延迟表中 Mac mini (M4) 的三行是实测值。
 
 **识别准确率** - `openai/whisper-small`，EdAcc `test`，200 条语音
 （`eval/benchmark.py accuracy ... --with-prompt`）
@@ -250,9 +249,20 @@ python eval/benchmark.py latency --audio path/to/30s_lecture_clip.wav --runs 20
 | --- | --- | --- | ---: | ---: | ---: | ---: |
 | MacBook Air (M1) | `mps` | float32 | `TBD-M1` | `TBD-M1` | `TBD-M1` | `TBD-M1` |
 | MacBook Air (M1) | `cpu` | float32 | `TBD-M1` | `TBD-M1` | `TBD-M1` | `TBD-M1` |
-| Mac mini (M4) | `mps` | float32 | `TBD-M4` | `TBD-M4` | `TBD-M4` | `TBD-M4` |
-| Mac mini (M4) | `mps` | float16 | `TBD-M4` | `TBD-M4` | `TBD-M4` | `TBD-M4` |
-| Mac mini (M4) | `cpu` | float32 | `TBD-M4` | `TBD-M4` | `TBD-M4` | `TBD-M4` |
+| Mac mini (M4, 16 GB) | `mps` | float32 | 2165 | 2174 | 0.072 | 656 |
+| Mac mini (M4, 16 GB) | `mps` | float16 | 1482 | 1490 | 0.049 | 740 |
+| Mac mini (M4, 16 GB) | `cpu` | float32 | 3319 | 3335 | 0.111 | 1790 |
+
+关于 Mac mini (M4) 三行数据的说明（2026-11-24 实测，PyTorch 2.15.0）：
+
+- 测试片段是用 macOS `say` 命令合成的一段讲解的前 30 秒，不是真实课堂录音；每次解码 166 个
+  文本 token。延迟随片段中语音量增加而上升，用于描述真实课堂的性能之前，请用自己的录音重新
+  测量。
+- 峰值 RSS 不包含 Metal 驱动内存，而 MPS 上模型权重正是放在那里：脚本报告的
+  `mps_driver_mb` 为 1447 MB（`float32`）和 1255 MB（`float16`）。CPU 那一行没有这部分内存，
+  所以 RSS 更高。
+- 在这台机器上，MPS 的 `float16` 与 `float32` 得到的转写结果相同。它仍然需要手动开启
+  （`--dtype float16` / `runtime.dtype: float16`），因为并非所有 macOS 与芯片组合都能保证这一点。
 
 填写方法：在对应机器上运行延迟评测命令（其他变体加上 `--device cpu` 或 `--dtype float16`），
 把打印出的表格行复制进来。

@@ -248,10 +248,9 @@ driver memory, which the script reports separately (`mps_driver_mb`).
 
 ### Results
 
-The tables below are **templates**: no number in them has been measured yet. Every
-cell is a placeholder to be replaced with a value measured on the named machine:
-`TBD-M1` = to be measured on an M1 MacBook Air, `TBD-M4` = to be measured on an M4 Mac
-mini, `TBD` = to be measured on the machine that runs the accuracy benchmark.
+Cells marked `TBD` or `TBD-M1` are **placeholders, not measurements**: `TBD-M1` = to be
+measured on an M1 MacBook Air, `TBD` = to be measured on the machine that runs the
+accuracy benchmark. The Mac mini (M4) rows of the latency table are measured values.
 
 **Recognition accuracy** - `openai/whisper-small`, EdAcc `test`, 200 utterances
 (`eval/benchmark.py accuracy ... --with-prompt`)
@@ -270,9 +269,22 @@ runs after 3 warm-up runs (`eval/benchmark.py latency --audio <clip>`)
 | --- | --- | --- | ---: | ---: | ---: | ---: |
 | MacBook Air (M1) | `mps` | float32 | `TBD-M1` | `TBD-M1` | `TBD-M1` | `TBD-M1` |
 | MacBook Air (M1) | `cpu` | float32 | `TBD-M1` | `TBD-M1` | `TBD-M1` | `TBD-M1` |
-| Mac mini (M4) | `mps` | float32 | `TBD-M4` | `TBD-M4` | `TBD-M4` | `TBD-M4` |
-| Mac mini (M4) | `mps` | float16 | `TBD-M4` | `TBD-M4` | `TBD-M4` | `TBD-M4` |
-| Mac mini (M4) | `cpu` | float32 | `TBD-M4` | `TBD-M4` | `TBD-M4` | `TBD-M4` |
+| Mac mini (M4, 16 GB) | `mps` | float32 | 2165 | 2174 | 0.072 | 656 |
+| Mac mini (M4, 16 GB) | `mps` | float16 | 1482 | 1490 | 0.049 | 740 |
+| Mac mini (M4, 16 GB) | `cpu` | float32 | 3319 | 3335 | 0.111 | 1790 |
+
+Notes on the Mac mini (M4) rows, measured on 2026-11-24 with PyTorch 2.15.0:
+
+- The clip is the first 30 s of a lecture synthesised with the macOS `say` command, not
+  a real classroom recording; each run decodes 166 text tokens. Latency grows with the
+  amount of speech in the clip, so re-measure with your own recording before quoting
+  these numbers for real lectures.
+- Peak RSS excludes Metal driver memory, which is where the weights live on MPS:
+  1447 MB (`float32`) and 1255 MB (`float16`) were reported as `mps_driver_mb`. The CPU
+  row has no such second pool, which is why its RSS is higher.
+- `float16` on MPS produced the same transcript as `float32` on this machine. It stays
+  opt-in (`--dtype float16` / `runtime.dtype: float16`) because that is not guaranteed
+  on every macOS and chip combination.
 
 To fill a row, run the latency command on that machine (add `--device cpu` or
 `--dtype float16` for the other variants) and copy the printed table row.
